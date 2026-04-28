@@ -1,0 +1,6 @@
+target/
+kafka-data/
+*.log
+.idea/
+*.class
+.DS_Store
