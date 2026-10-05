@@ -51,10 +51,16 @@ public class IdempotenceManager {
         this.snapshotInterval = Math.max(1, snapshotInterval);
     }
 
+    /**
+     * Idempotent: the snapshot is loaded only on first registration. The produce path calls this
+     * on every request, and reloading would overwrite newer in-memory state with the last
+     * snapshot, rejecting the producer's next sequence as a gap.
+     */
     public void registerPartitionDir(String topic, int partition, File partitionDir) {
         String key = topic + "-" + partition;
-        partitionDirectories.put(key, partitionDir);
-        loadSnapshot(key, partitionDir);
+        if (partitionDirectories.putIfAbsent(key, partitionDir) == null) {
+            loadSnapshot(key, partitionDir);
+        }
     }
 
     public IdempotentResult verifyAndApply(

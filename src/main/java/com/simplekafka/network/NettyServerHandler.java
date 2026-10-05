@@ -19,6 +19,11 @@ import java.util.logging.Logger;
 public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> {
     private static final Logger LOGGER = Logger.getLogger(NettyServerHandler.class.getName());
 
+    /** Per-connection queued request count at which the socket stops being read. */
+    public static final int PENDING_REQUESTS_HIGH_WATERMARK = 256;
+    /** Per-connection queued request count at which reading resumes. */
+    public static final int PENDING_REQUESTS_LOW_WATERMARK = 64;
+
     private final SimpleKafkaBroker broker;
     private final ExecutorService requestExecutionPool;
     private final ClientQuotaManager quotaManager;
@@ -43,19 +48,6 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, KafkaFrame frame) {
-        // High-watermark check for autoRead backpressure:
-        // When requestExecutionPool queue exceeds 80% capacity, stop reading from socket to throttle upstream
-        if (requestExecutionPool instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-            int queueSize = tpe.getQueue().size();
-            int remaining = tpe.getQueue().remainingCapacity();
-            int total = queueSize + remaining;
-            if (total > 0 && queueSize >= (int) (total * 0.8)) {
-                ctx.channel().config().setAutoRead(false);
-                LOGGER.warning("requestExecutionPool queue at 80%+ capacity (" + queueSize + "/" + total +
-                        "). Paused autoRead on channel: " + ctx.channel().id());
-            }
-        }
-
         // NON-BLOCKING EVENT-LOOP + CHANNEL ORDERING GUARANTEE:
         // SerializingExecutor executes tasks sequentially per channel on the worker pool,
         // preventing out-of-order execution of pipelined requests while offloading disk I/O.
@@ -70,26 +62,41 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                             KafkaFrame.ERROR_SERVER_ERROR, t.getMessage());
                     ctx.writeAndFlush(errorResponse);
                 } finally {
-                    // Low-watermark check to resume autoRead when queue drops below 20%
-                    if (requestExecutionPool instanceof java.util.concurrent.ThreadPoolExecutor tpe) {
-                        int queueSize = tpe.getQueue().size();
-                        int remaining = tpe.getQueue().remainingCapacity();
-                        int total = queueSize + remaining;
-                        if (total > 0 && queueSize <= (int) (total * 0.2)) {
-                            if (!ctx.channel().config().isAutoRead()) {
-                                ctx.channel().config().setAutoRead(true);
-                                LOGGER.info("requestExecutionPool queue drained below 20% (" + queueSize + "/" + total +
-                                        "). Resumed autoRead on channel: " + ctx.channel().id());
-                            }
-                        }
-                    }
+                    maybeResumeReading(ctx);
                 }
             });
+            pauseReadingIfBacklogged(ctx);
         } catch (java.util.concurrent.RejectedExecutionException ree) {
             LOGGER.warning("Broker overloaded: request execution queue full, rejecting frame " + frame.getCorrelationId());
             KafkaFrame overloadResponse = buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                     KafkaFrame.ERROR_BROKER_OVERLOADED, "BROKER_OVERLOADED: Request execution queue full");
             ctx.writeAndFlush(overloadResponse);
+        }
+    }
+
+    /**
+     * Per-connection backpressure. Runs on the event loop right after enqueueing, so the depth
+     * is current. Stopping reads lets the socket buffers fill and TCP flow control throttle the
+     * client. Frames already decoded from the current read still arrive, so the backlog can
+     * overshoot the high watermark by up to one read's worth.
+     */
+    private void pauseReadingIfBacklogged(ChannelHandlerContext ctx) {
+        if (channelExecutor.getQueueDepth() >= PENDING_REQUESTS_HIGH_WATERMARK && ctx.channel().config().isAutoRead()) {
+            ctx.channel().config().setAutoRead(false);
+            LOGGER.fine("Connection backlog at " + channelExecutor.getQueueDepth() +
+                    " requests. Paused autoRead on channel: " + ctx.channel().id());
+        }
+    }
+
+    /**
+     * Called after every request completes. Any task finishing after a pause observes
+     * autoRead == false, and a pause implies queued tasks remain, so reads always resume.
+     */
+    private void maybeResumeReading(ChannelHandlerContext ctx) {
+        if (!ctx.channel().config().isAutoRead() && channelExecutor.getQueueDepth() <= PENDING_REQUESTS_LOW_WATERMARK) {
+            ctx.channel().config().setAutoRead(true);
+            LOGGER.fine("Connection backlog drained to " + channelExecutor.getQueueDepth() +
+                    " requests. Resumed autoRead on channel: " + ctx.channel().id());
         }
     }
 
