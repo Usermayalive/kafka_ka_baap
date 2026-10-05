@@ -1,5 +1,6 @@
 package com.simplekafka.broker;
 
+
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonArray;
@@ -14,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,6 +28,11 @@ public class SimpleKafkaBroker {
     private static final String DATA_DIR = "kafka-data";
     
     private final int brokerId;
+
+    public int getBrokerId() {
+        return brokerId;
+    }
+
     private final String brokerHost;
     private final int brokerPort;
     private final Map<String, List<Partition>> topics;
@@ -36,6 +43,7 @@ public class SimpleKafkaBroker {
     private final Map<Integer, BrokerInfo> clusterMetadata;
     private final ZookeeperClient zkClient;
     private final Gson gson;
+    private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> topicCreationGuards = new ConcurrentHashMap<>();
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -192,22 +200,56 @@ public class SimpleKafkaBroker {
         electController();
     }
 
-    private void createTopic(String topic, int numPartitions, short replicationFactor) {
+    public volatile Runnable preTopicCreationHook = null;
+
+    public void createTopic(String topic, int numPartitions, short replicationFactor) {
         if (!isController.get()) {
             LOGGER.warning("Only controller can create topics");
             return;
         }
 
+        if (topics.containsKey(topic)) {
+            LOGGER.info("Topic " + topic + " already exists on broker (idempotent no-op)");
+            return;
+        }
+
+        java.util.concurrent.CompletableFuture<Void> myFuture = new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.CompletableFuture<Void> existing = topicCreationGuards.putIfAbsent(topic, myFuture);
+        if (existing != null) {
+            // Wait for the creator thread to finish
+            try {
+                existing.join();
+            } catch (Exception e) {
+                LOGGER.warning("Wait for concurrent creation of topic " + topic + " failed: " + e.getMessage());
+            }
+            return;
+        }
+
         try {
+            if (topics.containsKey(topic)) {
+                myFuture.complete(null);
+                return;
+            }
+
+            if (preTopicCreationHook != null) {
+                preTopicCreationHook.run();
+            }
+
             JsonObject config = new JsonObject();
             config.addProperty("partitions", numPartitions);
             config.addProperty("replication_factor", replicationFactor);
+            if (topic.endsWith(".dlq")) {
+                config.addProperty("cleanup.policy", "compact");
+            }
             zkClient.createPersistentNode("/topics/" + topic, gson.toJson(config));
             
             zkClient.createPath("/topics/" + topic + "/partitions");
 
             List<Partition> topicPartitions = new ArrayList<>();
             List<Integer> availableBrokers = new ArrayList<>(clusterMetadata.keySet());
+            if (availableBrokers.isEmpty()) {
+                availableBrokers.add(brokerId);
+            }
 
             for (int i = 0; i < numPartitions; i++) {
                 int leader = availableBrokers.get(i % availableBrokers.size());
@@ -231,9 +273,22 @@ public class SimpleKafkaBroker {
                 zkClient.createPersistentNode("/topics/" + topic + "/partitions/" + i + "/state", gson.toJson(state));
             }
             
-            LOGGER.info("Topic created: " + topic);
+            loadTopic(topic);
+            LOGGER.info("Topic created and loaded: " + topic);
+
+            // Auto-provision companion DLQ topic with 1 partition if eligible (excludes internal topics)
+            if (com.simplekafka.client.DeadLetterRouter.isEligibleForDlq(topic)) {
+                String dlqTopic = topic + ".dlq";
+                LOGGER.info("Auto-provisioning companion DLQ topic: " + dlqTopic);
+                createTopic(dlqTopic, 1, replicationFactor);
+            }
+
+            myFuture.complete(null);
         } catch (Exception e) {
+            myFuture.completeExceptionally(e);
+            topicCreationGuards.remove(topic);
             LOGGER.log(Level.SEVERE, "Failed to create topic " + topic, e);
+            throw new RuntimeException("Failed to create topic: " + topic, e);
         }
     }
 
@@ -262,6 +317,9 @@ public class SimpleKafkaBroker {
                     if (leader == brokerId || replicas.contains(brokerId)) {
                         String baseDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
                         Partition partition = new Partition(i, baseDir);
+                        if (config.has("cleanup.policy") && "compact".equalsIgnoreCase(config.get("cleanup.policy").getAsString())) {
+                            partition.setCompacted(true);
+                        }
                         partition.setLeader(leader);
                         List<Integer> followers = new ArrayList<>(replicas);
                         followers.remove((Integer) leader);
@@ -286,6 +344,26 @@ public class SimpleKafkaBroker {
         }
     }
 
+    public void compactTopic(String topic, int partitionId) throws IOException {
+        List<Partition> parts = topics.get(topic);
+        if (parts != null && partitionId < parts.size()) {
+            CompactionKeyExtractor extractor = topic.endsWith(".dlq")
+                    ? msg -> {
+                        try {
+                            return com.simplekafka.client.DeadLetterEnvelope.deserialize(msg).getDeduplicationKey();
+                        } catch (Exception e) {
+                            return java.util.UUID.nameUUIDFromBytes(msg).toString();
+                        }
+                    }
+                    : msg -> java.util.UUID.nameUUIDFromBytes(msg).toString();
+            parts.get(partitionId).compact(extractor);
+        }
+    }
+
+    public Map<String, List<Partition>> getTopics() {
+        return topics;
+    }
+
     private void rebalancePartitions() {
         if (!isController.get()) return;
         LOGGER.info("Rebalancing partitions...");
@@ -301,8 +379,20 @@ public class SimpleKafkaBroker {
 
         List<Partition> parts = topics.get(topic);
         if (parts == null || partitionId >= parts.size()) {
-            Protocol.sendErrorResponse(clientChannel, "Topic/Partition not found");
-            return;
+            // Simplified atomic auto-create: delegates directly to atomic createTopic()
+            if (topic.endsWith(".dlq") && isController.get()) {
+                LOGGER.info("Auto-provisioning companion DLQ topic on first produce: " + topic);
+                try {
+                    createTopic(topic, 1, (short) 1);
+                    parts = topics.get(topic);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Failed to auto-create DLQ topic: " + topic, e);
+                }
+            }
+            if (parts == null || partitionId >= parts.size()) {
+                Protocol.sendErrorResponse(clientChannel, "Topic/Partition not found");
+                return;
+            }
         }
 
         Partition partition = parts.get(partitionId);

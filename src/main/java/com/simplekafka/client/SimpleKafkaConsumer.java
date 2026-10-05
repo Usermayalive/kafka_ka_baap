@@ -14,23 +14,57 @@ public class SimpleKafkaConsumer {
     private final SimpleKafkaClient client;
     private final String topic;
     private final int partition;
-    private long currentOffset;
+    private long currentOffset;      // Fetch cursor for the next poll
+    private long committedOffset;    // High watermark of successfully processed / routed records
     private final AtomicBoolean running;
+    private final AtomicBoolean paused;
     private Thread consumerThread;
 
     public SimpleKafkaConsumer(String bootstrapBroker, int bootstrapPort, String topic, int partition) {
-        this.client = new SimpleKafkaClient(bootstrapBroker, bootstrapPort);
+        this(new SimpleKafkaClient(bootstrapBroker, bootstrapPort), topic, partition);
+    }
+
+    SimpleKafkaConsumer(SimpleKafkaClient client, String topic, int partition) {
+        this.client = client;
         this.topic = topic;
         this.partition = partition;
         this.currentOffset = 0;
+        this.committedOffset = 0;
         this.running = new AtomicBoolean(false);
+        this.paused = new AtomicBoolean(false);
     }
+
+    private final java.util.Queue<byte[]> fetchBuffer = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     public void initialize() throws IOException {
         client.initialize();
     }
 
+    public boolean isPaused() {
+        return paused.get();
+    }
+
+    public void pause() {
+        paused.set(true);
+    }
+
+    public void resume() {
+        paused.set(false);
+    }
+
+    public java.util.Queue<byte[]> getFetchBuffer() {
+        return fetchBuffer;
+    }
+
     public List<byte[]> poll() throws IOException {
+        if (!fetchBuffer.isEmpty()) {
+            List<byte[]> buffered = new java.util.ArrayList<>();
+            while (!fetchBuffer.isEmpty()) {
+                buffered.add(fetchBuffer.poll());
+            }
+            currentOffset += buffered.size();
+            return buffered;
+        }
         List<byte[]> messages = client.fetch(topic, partition, currentOffset, MAX_BYTES);
         if (!messages.isEmpty()) {
             currentOffset += messages.size();
@@ -39,15 +73,50 @@ public class SimpleKafkaConsumer {
     }
 
     public void startConsuming(MessageHandler handler) {
+        startConsuming(handler, null);
+    }
+
+    /**
+     * Consumes records from the partition with strict DLQ delivery and offset commit ordering:
+     * 1. handler.handle(msg, offset) executes.
+     * 2. If handler throws, dlqRouter applies retry policy with backoff.
+     * 3. If retries exhaust or error is fatal, dlqRouter serializes envelope and produces to {topic}.dlq.
+     * 4. IF DLQ produce succeeds -> committedOffset advances to msgOffset + 1.
+     * 5. IF DLQ produce fails -> committedOffset DOES NOT advance (remains at poison pill offset).
+     *    Fetch cursor (currentOffset) is rewound to msgOffset, remaining in-flight buffer is discarded,
+     *    and the partition is paused to prevent silent data loss.
+     */
+    public void startConsuming(MessageHandler handler, DeadLetterRouter dlqRouter) {
         if (running.compareAndSet(false, true)) {
             consumerThread = new Thread(() -> {
                 try {
                     while (running.get()) {
+                        if (paused.get()) {
+                            Thread.sleep(POLL_INTERVAL_MS);
+                            continue;
+                        }
+
                         List<byte[]> messages = poll();
 
                         long batchStartOffset = currentOffset - messages.size();
                         for (int i = 0; i < messages.size(); i++) {
-                            handler.handle(messages.get(i), batchStartOffset + i);
+                            long msgOffset = batchStartOffset + i;
+                            byte[] msg = messages.get(i);
+                            if (dlqRouter != null) {
+                                DeadLetterRouter.RoutingResult result = dlqRouter.handleMessage(topic, partition, msgOffset, msg, (m, off) -> handler.handle(m, off));
+                                if (result.isFatalDlqProduceError()) {
+                                    LOGGER.severe(String.format("FATAL: Failed to route poison pill at [%s-p%d@%d] to DLQ. Rewinding fetch cursor and pausing consumption at offset %d to prevent silent data loss!",
+                                            topic, partition, msgOffset, msgOffset));
+                                    seek(msgOffset); // Rewind fetch cursor; remaining batch messages are discarded
+                                    this.paused.set(true); // Pause partition to prevent advancing
+                                    break;
+                                } else {
+                                    this.committedOffset = msgOffset + 1;
+                                }
+                            } else {
+                                handler.handle(msg, msgOffset);
+                                this.committedOffset = msgOffset + 1;
+                            }
                         }
 
                         if (messages.isEmpty()) {
@@ -63,7 +132,7 @@ public class SimpleKafkaConsumer {
             });
             consumerThread.setDaemon(true);
             consumerThread.start();
-            LOGGER.info("Started consuming from topic: " + topic + ", partition: " + partition);
+            LOGGER.info("Started consuming from topic: " + topic + ", partition: " + partition + (dlqRouter != null ? " [DLQ active]" : ""));
         }
     }
 
@@ -83,10 +152,15 @@ public class SimpleKafkaConsumer {
 
     public void seek(long offset) {
         this.currentOffset = offset;
+        this.fetchBuffer.clear();
     }
 
     public long getCurrentOffset() {
         return currentOffset;
+    }
+
+    public long getCommittedOffset() {
+        return committedOffset;
     }
 
     public static void main(String[] args) throws Exception {
