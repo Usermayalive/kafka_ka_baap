@@ -2,6 +2,7 @@ package com.simplekafka.broker;
 
 
 import com.google.gson.Gson;
+import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonArray;
 
@@ -44,6 +45,7 @@ public class SimpleKafkaBroker {
     private final ZookeeperClient zkClient;
     private final Gson gson;
     private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> topicCreationGuards = new ConcurrentHashMap<>();
+    private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -316,7 +318,7 @@ public class SimpleKafkaBroker {
 
                     if (leader == brokerId || replicas.contains(brokerId)) {
                         String baseDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
-                        Partition partition = new Partition(i, baseDir);
+                        Partition partition = new Partition(i, baseDir, durabilityMode);
                         if (config.has("cleanup.policy") && "compact".equalsIgnoreCase(config.get("cleanup.policy").getAsString())) {
                             partition.setCompacted(true);
                         }
@@ -635,9 +637,21 @@ public class SimpleKafkaBroker {
         }
     }
 
+    /**
+     * Durability for partitions this broker opens from now on (see docs/durability.md).
+     * Set before start(); partitions already open keep the mode they were created with.
+     */
+    public void setDurabilityMode(DurabilityMode durabilityMode) {
+        this.durabilityMode = durabilityMode;
+    }
+
+    public DurabilityMode getDurabilityMode() {
+        return durabilityMode;
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: SimpleKafkaBroker <brokerId> <host> <port> <zkPort>");
+            System.err.println("Usage: SimpleKafkaBroker <brokerId> <host> <port> <zkPort> [OS_PAGE_CACHE|PHYSICAL_FSYNC]");
             System.exit(1);
         }
         
@@ -647,6 +661,9 @@ public class SimpleKafkaBroker {
         int zkPort = Integer.parseInt(args[3]);
         
         SimpleKafkaBroker broker = new SimpleKafkaBroker(brokerId, host, port, zkPort);
+        if (args.length >= 5) {
+            broker.setDurabilityMode(DurabilityMode.valueOf(args[4]));
+        }
         broker.start();
         
         Runtime.getRuntime().addShutdownHook(new Thread(broker::stop));
