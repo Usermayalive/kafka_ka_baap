@@ -20,6 +20,7 @@ public class KafkaFrame {
     public static final short API_KEY_FETCH = 2;
     public static final short API_KEY_INIT_PRODUCER_ID = 3;
     public static final short API_KEY_METADATA = 4;
+    public static final short API_KEY_CREATE_TOPIC = 5;
 
     // Error Codes
     public static final short ERROR_NONE = 0;
@@ -31,6 +32,10 @@ public class KafkaFrame {
     public static final short ERROR_SERVER_ERROR = 1005;
     public static final short ERROR_BROKER_OVERLOADED = 1006;
     public static final short ERROR_DUPLICATE_SEQUENCE = 1007;
+    public static final short ERROR_NOT_CONTROLLER = 1008;
+
+    /** Produce with this producer ID to bypass idempotence (Kafka's NO_PRODUCER_ID). */
+    public static final long NO_PRODUCER_ID = -1L;
 
     private final short apiKey;
     private final short apiVersion;

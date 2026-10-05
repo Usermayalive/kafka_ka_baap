@@ -57,19 +57,33 @@ public class SimpleKafkaConsumer {
     }
 
     public List<byte[]> poll() throws IOException {
+        List<byte[]> payloads = new java.util.ArrayList<>();
+        for (SimpleKafkaClient.FetchedRecord r : pollRecords()) {
+            payloads.add(r.payload());
+        }
+        return payloads;
+    }
+
+    /**
+     * Fetches the next batch and advances the cursor past the last record's offset. Offsets
+     * come from the broker, so compaction gaps are skipped correctly. Records injected via
+     * getFetchBuffer() are numbered consecutively from the current cursor.
+     */
+    public List<SimpleKafkaClient.FetchedRecord> pollRecords() throws IOException {
+        List<SimpleKafkaClient.FetchedRecord> records;
         if (!fetchBuffer.isEmpty()) {
             List<byte[]> buffered = new java.util.ArrayList<>();
             while (!fetchBuffer.isEmpty()) {
                 buffered.add(fetchBuffer.poll());
             }
-            currentOffset += buffered.size();
-            return buffered;
+            records = SimpleKafkaClient.contiguous(currentOffset, buffered);
+        } else {
+            records = client.fetchRecords(topic, partition, currentOffset, MAX_BYTES);
         }
-        List<byte[]> messages = client.fetch(topic, partition, currentOffset, MAX_BYTES);
-        if (!messages.isEmpty()) {
-            currentOffset += messages.size();
+        if (!records.isEmpty()) {
+            currentOffset = records.get(records.size() - 1).offset() + 1;
         }
-        return messages;
+        return records;
     }
 
     public void startConsuming(MessageHandler handler) {
@@ -96,12 +110,11 @@ public class SimpleKafkaConsumer {
                             continue;
                         }
 
-                        List<byte[]> messages = poll();
+                        List<SimpleKafkaClient.FetchedRecord> messages = pollRecords();
 
-                        long batchStartOffset = currentOffset - messages.size();
-                        for (int i = 0; i < messages.size(); i++) {
-                            long msgOffset = batchStartOffset + i;
-                            byte[] msg = messages.get(i);
+                        for (SimpleKafkaClient.FetchedRecord record : messages) {
+                            long msgOffset = record.offset();
+                            byte[] msg = record.payload();
                             if (dlqRouter != null) {
                                 DeadLetterRouter.RoutingResult result = dlqRouter.handleMessage(topic, partition, msgOffset, msg, (m, off) -> handler.handle(m, off));
                                 if (result.isFatalDlqProduceError()) {

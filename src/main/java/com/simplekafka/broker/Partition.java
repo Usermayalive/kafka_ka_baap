@@ -341,62 +341,74 @@ public class Partition {
         }
     }
 
+    /** A stored record with its offset; offsets are not contiguous after compaction. */
+    public record Record(long offset, byte[] payload) {}
+
     public List<byte[]> readMessages(long offset, int maxBytes) throws IOException {
+        List<Record> records = readRecords(offset, maxBytes);
+        List<byte[]> payloads = new ArrayList<>(records.size());
+        for (Record r : records) {
+            payloads.add(r.payload());
+        }
+        return payloads;
+    }
+
+    /**
+     * Reads records with offset >= {@code offset}, crossing segment boundaries, until
+     * {@code maxBytes} is reached. Always returns at least one record if any exists, so a
+     * record larger than maxBytes can't stall a consumer. Offsets come from the index, so
+     * compaction gaps are reported faithfully.
+     */
+    public List<Record> readRecords(long offset, int maxBytes) throws IOException {
         lock.readLock().lock();
         try {
-            if (offset >= nextOffset.get() || offset < 0) {
+            if (offset >= nextOffset.get() || segments.isEmpty()) {
                 return Collections.emptyList();
             }
 
-            SegmentInfo segment = findSegmentForOffset(offset);
-            if (segment == null) {
-                return Collections.emptyList();
-            }
-
-            long position = findPositionForOffset(segment, offset);
-            if (position < 0) {
-                return Collections.emptyList();
-            }
-
-            List<byte[]> messages = new ArrayList<>();
+            List<Record> records = new ArrayList<>();
             int bytesRead = 0;
-
-            try (RandomAccessFile readLog = new RandomAccessFile(segment.logFile, "r")) {
-                readLog.seek(position);
-
-                while (bytesRead < maxBytes && readLog.getFilePointer() < readLog.length()) {
-                    int messageSize = readLog.readInt();
-                    
-                    // Always return at least one message to prevent blocking
-                    if (bytesRead > 0 && bytesRead + 4 + messageSize > maxBytes) {
-                        break; 
+            for (int s = findSegmentIndex(Math.max(offset, 0)); s < segments.size(); s++) {
+                SegmentInfo segment = segments.get(s);
+                try (RandomAccessFile index = new RandomAccessFile(segment.indexFile, "r");
+                     RandomAccessFile log = new RandomAccessFile(segment.logFile, "r")) {
+                    long entries = index.length() / INDEX_ENTRY_BYTES;
+                    for (long e = firstEntryAtOrAfter(index, entries, offset); e < entries; e++) {
+                        index.seek(e * INDEX_ENTRY_BYTES);
+                        long recordOffset = index.readLong();
+                        long position = index.readLong();
+                        log.seek(position);
+                        int size = log.readInt();
+                        if (!records.isEmpty() && bytesRead + 4 + size > maxBytes) {
+                            return records;
+                        }
+                        byte[] payload = new byte[size];
+                        log.readFully(payload);
+                        records.add(new Record(recordOffset, payload));
+                        bytesRead += 4 + size;
                     }
-
-                    byte[] message = new byte[messageSize];
-                    readLog.readFully(message);
-                    messages.add(message);
-                    bytesRead += (4 + messageSize);
                 }
             }
-            
-            return messages;
-
+            return records;
         } finally {
             lock.readLock().unlock();
         }
     }
 
-    private SegmentInfo findSegmentForOffset(long offset) {
+    /** Offset the next append will receive (the log end offset). */
+    public long getNextOffset() {
+        return nextOffset.get();
+    }
+
+    /** Index of the last segment whose base offset is <= offset, or 0 if offset precedes all segments. */
+    private int findSegmentIndex(long offset) {
         int left = 0;
         int right = segments.size() - 1;
-        SegmentInfo result = null;
-
+        int result = 0;
         while (left <= right) {
-            int mid = left + (right - left) / 2;
-            SegmentInfo midSegment = segments.get(mid);
-
-            if (midSegment.baseOffset <= offset) {
-                result = midSegment;
+            int mid = (left + right) >>> 1;
+            if (segments.get(mid).baseOffset <= offset) {
+                result = mid;
                 left = mid + 1;
             } else {
                 right = mid - 1;
@@ -405,32 +417,20 @@ public class Partition {
         return result;
     }
 
-    private long findPositionForOffset(SegmentInfo segment, long offset) throws IOException {
-        try (RandomAccessFile readIndex = new RandomAccessFile(segment.indexFile, "r")) {
-            long entryCount = readIndex.length() / 16;
-            if (entryCount == 0) return -1;
-
-            long low = 0;
-            long high = entryCount - 1;
-            long foundPosition = -1;
-
-            while (low <= high) {
-                long mid = low + (high - low) / 2;
-                readIndex.seek(mid * 16);
-                long storedOffset = readIndex.readLong();
-                long dataPos = readIndex.readLong();
-
-                if (storedOffset == offset) {
-                    return dataPos;
-                } else if (storedOffset < offset) {
-                    low = mid + 1;
-                } else {
-                    foundPosition = dataPos;
-                    high = mid - 1;
-                }
+    /** Binary search over a dense index sorted by offset: first entry with offset >= target. */
+    private static long firstEntryAtOrAfter(RandomAccessFile index, long entries, long target) throws IOException {
+        long low = 0;
+        long high = entries;
+        while (low < high) {
+            long mid = (low + high) >>> 1;
+            index.seek(mid * INDEX_ENTRY_BYTES);
+            if (index.readLong() < target) {
+                low = mid + 1;
+            } else {
+                high = mid;
             }
-            return foundPosition;
         }
+        return low;
     }
 
     private boolean compacted = false;

@@ -108,6 +108,10 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                 return handleProduce(frame);
             case KafkaFrame.API_KEY_FETCH:
                 return handleFetch(frame);
+            case KafkaFrame.API_KEY_METADATA:
+                return handleMetadata(frame);
+            case KafkaFrame.API_KEY_CREATE_TOPIC:
+                return handleCreateTopic(frame);
             default:
                 return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                         KafkaFrame.ERROR_CORRUPT_MESSAGE, "Unknown apiKey: " + frame.getApiKey());
@@ -166,6 +170,9 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         }
 
         Partition partition = parts.get(partitionId);
+        if (producerId == KafkaFrame.NO_PRODUCER_ID) {
+            return produceResponse(frame, topic, partitionId, partition.append(message), false);
+        }
         idempotenceManager.registerPartitionDir(topic, partitionId, new File(partition.getBaseDir()));
 
         // 3. Idempotent Sequence & Epoch Verification
@@ -174,16 +181,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                     topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.append(message)
             );
 
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            DataOutputStream dos = new DataOutputStream(baos);
-            dos.writeShort(KafkaFrame.ERROR_NONE);
-            dos.writeUTF(topic);
-            dos.writeInt(partitionId);
-            dos.writeLong(result.offset());
-            dos.writeBoolean(result.isDuplicate());
-            dos.flush();
-
-            return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
+            return produceResponse(frame, topic, partitionId, result.offset(), result.isDuplicate());
         } catch (ProducerFencedException pfe) {
             LOGGER.warning("Producer fenced: " + pfe.getMessage());
             return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
@@ -214,18 +212,85 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         }
 
         Partition partition = parts.get(partitionId);
-        List<byte[]> messages = partition.readMessages(fetchOffset, maxBytes);
+        List<Partition.Record> records = partition.readRecords(fetchOffset, maxBytes);
 
+        // [error][count]{[offset:8][len:4][payload]}[logEndOffset:8]
+        // Offsets are explicit: compacted partitions have gaps.
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         DataOutputStream dos = new DataOutputStream(baos);
         dos.writeShort(KafkaFrame.ERROR_NONE);
-        dos.writeInt(messages.size());
-        for (byte[] m : messages) {
-            dos.writeInt(m.length);
-            dos.write(m);
+        dos.writeInt(records.size());
+        for (Partition.Record r : records) {
+            dos.writeLong(r.offset());
+            dos.writeInt(r.payload().length);
+            dos.write(r.payload());
         }
+        dos.writeLong(partition.getNextOffset());
         dos.flush();
 
+        return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
+    }
+
+    private KafkaFrame produceResponse(KafkaFrame frame, String topic, int partitionId, long offset, boolean duplicate)
+            throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(baos);
+        dos.writeShort(KafkaFrame.ERROR_NONE);
+        dos.writeUTF(topic);
+        dos.writeInt(partitionId);
+        dos.writeLong(offset);
+        dos.writeBoolean(duplicate);
+        dos.flush();
+        return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
+    }
+
+    /**
+     * Request: [clientId]. Response: [error][brokerCount]{[id:4][host][port:4]}
+     * [topicCount]{[name][partitionCount]{[partition:4][leader:4][replicaCount:4]{[replica:4]}}}
+     */
+    private KafkaFrame handleMetadata(KafkaFrame frame) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(baos);
+        dos.writeShort(KafkaFrame.ERROR_NONE);
+        List<com.simplekafka.broker.BrokerInfo> brokers = broker.liveBrokers();
+        dos.writeInt(brokers.size());
+        for (com.simplekafka.broker.BrokerInfo b : brokers) {
+            dos.writeInt(b.getId());
+            dos.writeUTF(b.getHost());
+            dos.writeInt(b.getPort());
+        }
+        List<SimpleKafkaBroker.TopicDescription> topics = broker.describeTopics();
+        dos.writeInt(topics.size());
+        for (SimpleKafkaBroker.TopicDescription t : topics) {
+            dos.writeUTF(t.name());
+            dos.writeInt(t.partitions().size());
+            for (SimpleKafkaBroker.PartitionDescription p : t.partitions()) {
+                dos.writeInt(p.partitionId());
+                dos.writeInt(p.leader());
+                dos.writeInt(p.replicas().size());
+                for (int replica : p.replicas()) {
+                    dos.writeInt(replica);
+                }
+            }
+        }
+        dos.flush();
+        return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
+    }
+
+    /** Request: [clientId][topic][partitions:4][replicationFactor:2]. Only the controller creates topics. */
+    private KafkaFrame handleCreateTopic(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String topic = dis.readUTF();
+        int partitions = dis.readInt();
+        short replicationFactor = dis.readShort();
+        if (!broker.isController()) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
+                    KafkaFrame.ERROR_NOT_CONTROLLER, "Broker " + broker.getBrokerId() + " is not the controller");
+        }
+        broker.createTopic(topic, partitions, replicationFactor);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        new DataOutputStream(baos).writeShort(KafkaFrame.ERROR_NONE);
         return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
     }
 

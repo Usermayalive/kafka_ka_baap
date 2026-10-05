@@ -444,8 +444,8 @@ public class DeadLetterQueueTest {
         List<byte[]> queue = List.of(poisonPill);
         SimpleKafkaClient mockClient = new SimpleKafkaClient("localhost", 9092) {
             @Override
-            public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) {
-                return queue;
+            public List<SimpleKafkaClient.FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) {
+                return SimpleKafkaClient.contiguous(offset, queue);
             }
         };
 
@@ -481,10 +481,10 @@ public class DeadLetterQueueTest {
         AtomicInteger fetchCount = new AtomicInteger(0);
         SimpleKafkaClient mockClient = new SimpleKafkaClient("localhost", 9092) {
             @Override
-            public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) {
+            public List<SimpleKafkaClient.FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) {
                 // Return the batch on first fetch, empty on subsequent
-                if (fetchCount.getAndIncrement() == 0) return batch;
-                return Collections.emptyList();
+                if (fetchCount.getAndIncrement() == 0) return SimpleKafkaClient.contiguous(offset, batch);
+                return SimpleKafkaClient.contiguous(offset, Collections.emptyList());
             }
         };
 
@@ -543,9 +543,9 @@ public class DeadLetterQueueTest {
         AtomicInteger fetchCount = new AtomicInteger(0);
         SimpleKafkaClient mockClient = new SimpleKafkaClient("localhost", 9092) {
             @Override
-            public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) {
-                if (fetchCount.getAndIncrement() == 0) return batch;
-                return Collections.emptyList();
+            public List<SimpleKafkaClient.FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) {
+                if (fetchCount.getAndIncrement() == 0) return SimpleKafkaClient.contiguous(offset, batch);
+                return SimpleKafkaClient.contiguous(offset, Collections.emptyList());
             }
         };
 
@@ -592,11 +592,11 @@ public class DeadLetterQueueTest {
 
         SimpleKafkaClient mockClient = new SimpleKafkaClient("localhost", 9092) {
             @Override
-            public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) {
+            public List<SimpleKafkaClient.FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) {
                 if (offset == 2) {
-                    return List.of(rec2, rec3, rec4);
+                    return SimpleKafkaClient.contiguous(offset, List.of(rec2, rec3, rec4));
                 }
-                return Collections.emptyList();
+                return SimpleKafkaClient.contiguous(offset, Collections.emptyList());
             }
         };
 
@@ -866,8 +866,8 @@ public class DeadLetterQueueTest {
         List<byte[]> queue = List.of("legacy-1".getBytes(StandardCharsets.UTF_8), "legacy-2".getBytes(StandardCharsets.UTF_8));
         SimpleKafkaClient mockClient = new SimpleKafkaClient("localhost", 9092) {
             @Override
-            public List<byte[]> fetch(String topic, int partition, long offset, int maxBytes) {
-                return offset == 0 ? queue : Collections.emptyList();
+            public List<SimpleKafkaClient.FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) {
+                return SimpleKafkaClient.contiguous(offset, offset == 0 ? queue : Collections.emptyList());
             }
         };
 

@@ -2,24 +2,21 @@ package com.simplekafka.broker;
 
 
 import com.google.gson.Gson;
+import com.simplekafka.network.ClientQuotaManager;
+import com.simplekafka.network.IdempotenceManager;
+import com.simplekafka.network.NettyBrokerServer;
+import com.simplekafka.network.ProducerIdManager;
 import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonArray;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -37,8 +34,7 @@ public class SimpleKafkaBroker {
     private final String brokerHost;
     private final int brokerPort;
     private final Map<String, List<Partition>> topics;
-    private final ExecutorService executor;
-    private final ServerSocketChannel serverChannel;
+    private NettyBrokerServer nettyServer;
     private final AtomicBoolean isRunning;
     private final AtomicBoolean isController;
     private final Map<Integer, BrokerInfo> clusterMetadata;
@@ -52,8 +48,6 @@ public class SimpleKafkaBroker {
         this.brokerHost = host;
         this.brokerPort = port;
         this.topics = new ConcurrentHashMap<>();
-        this.executor = Executors.newFixedThreadPool(10);
-        this.serverChannel = ServerSocketChannel.open();
         this.isRunning = new AtomicBoolean(false);
         this.isController = new AtomicBoolean(false);
         this.clusterMetadata = new ConcurrentHashMap<>();
@@ -71,27 +65,26 @@ public class SimpleKafkaBroker {
 
     public void start() throws Exception {
         isRunning.set(true);
-        serverChannel.bind(new InetSocketAddress(brokerHost, brokerPort));
-        serverChannel.configureBlocking(false);
-
         LOGGER.info("Starting broker " + brokerId + " on " + brokerHost + ":" + brokerPort);
-        
+
+        nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, new ClientQuotaManager(),
+                new IdempotenceManager(),
+                new ProducerIdManager((short) brokerId, new File(DATA_DIR + File.separator + brokerId, "producer_id_epoch")),
+                NettyBrokerServer.DEFAULT_REQUEST_QUEUE_CAPACITY);
+        nettyServer.start();
+
         zkClient.connect();
         registerWithZookeeper();
         electController();
         loadExistingTopics();
-
-        // Start accepting connections in a separate thread
-        new Thread(this::acceptConnections, "Accept-Thread").start();
     }
 
     public void stop() {
         isRunning.set(false);
         try {
-            if (serverChannel != null) {
-                serverChannel.close();
+            if (nettyServer != null) {
+                nettyServer.stop();
             }
-            executor.shutdown();
             zkClient.close();
             LOGGER.info("Broker " + brokerId + " stopped");
         } catch (Exception e) {
@@ -372,269 +365,60 @@ public class SimpleKafkaBroker {
         // Rebalancing logic to be implemented
     }
 
-    private void handleProduceRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        String topic = readString(buffer);
-        int partitionId = buffer.getInt();
-        int messageLength = buffer.getInt();
-        byte[] message = new byte[messageLength];
-        buffer.get(message);
-
-        List<Partition> parts = topics.get(topic);
-        if (parts == null || partitionId >= parts.size()) {
-            // Simplified atomic auto-create: delegates directly to atomic createTopic()
-            if (topic.endsWith(".dlq") && isController.get()) {
-                LOGGER.info("Auto-provisioning companion DLQ topic on first produce: " + topic);
-                try {
-                    createTopic(topic, 1, (short) 1);
-                    parts = topics.get(topic);
-                } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "Failed to auto-create DLQ topic: " + topic, e);
-                }
-            }
-            if (parts == null || partitionId >= parts.size()) {
-                Protocol.sendErrorResponse(clientChannel, "Topic/Partition not found");
-                return;
-            }
+    /** Brokers currently registered in cluster metadata; just this broker when running standalone. */
+    public List<BrokerInfo> liveBrokers() {
+        if (clusterMetadata.isEmpty()) {
+            return List.of(new BrokerInfo(brokerId, brokerHost, getPort()));
         }
-
-        Partition partition = parts.get(partitionId);
-        if (partition.getLeader() != brokerId) {
-            Protocol.sendErrorResponse(clientChannel, "Not leader for partition");
-            return;
-        }
-
-        long offset = partition.append(message);
-        
-        // Replicate to followers
-        for (int follower : partition.getFollowers()) {
-            executor.submit(() -> replicateToFollowers(topic, partition, message, offset, follower));
-        }
-
-        // Send Produce Response
-        ByteBuffer response = ByteBuffer.allocate(1 + 8);
-        response.put(Protocol.PRODUCE_RESPONSE);
-        response.putLong(offset);
-        response.flip();
-        while (response.hasRemaining()) {
-            clientChannel.write(response);
-        }
+        return new ArrayList<>(clusterMetadata.values());
     }
 
-    private void handleFetchRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        String topic = readString(buffer);
-        int partitionId = buffer.getInt();
-        long offset = buffer.getLong();
-        int maxBytes = buffer.getInt();
+    public record PartitionDescription(int partitionId, int leader, List<Integer> replicas) {}
 
-        List<Partition> parts = topics.get(topic);
-        if (parts == null || partitionId >= parts.size()) {
-            Protocol.sendErrorResponse(clientChannel, "Topic/Partition not found");
-            return;
-        }
+    public record TopicDescription(String name, List<PartitionDescription> partitions) {}
 
-        Partition partition = parts.get(partitionId);
-        List<byte[]> messages = partition.readMessages(offset, maxBytes);
-
-        // Calculate response size
-        int totalSize = 1 + 4; // Type + Count
-        for (byte[] msg : messages) {
-            totalSize += 8 + 4 + msg.length; // offset + size + data
-        }
-
-        ByteBuffer response = ByteBuffer.allocate(totalSize);
-        response.put(Protocol.FETCH_RESPONSE);
-        response.putInt(messages.size());
-        
-        long currOffset = offset;
-        for (byte[] msg : messages) {
-            response.putLong(currOffset++);
-            response.putInt(msg.length);
-            response.put(msg);
-        }
-        
-        response.flip();
-        while (response.hasRemaining()) {
-            clientChannel.write(response);
-        }
-    }
-
-    private void handleMetadataRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        int brokerCount = clusterMetadata.size();
-        ByteBuffer response = ByteBuffer.allocate(8192);
-        response.put(Protocol.METADATA_RESPONSE);
-        response.putInt(brokerCount);
-        for (BrokerInfo info : clusterMetadata.values()) {
-            response.putInt(info.getId());
-            byte[] hostBytes = info.getHost().getBytes(StandardCharsets.UTF_8);
-            response.putShort((short) hostBytes.length);
-            response.put(hostBytes);
-            response.putInt(info.getPort());
-        }
-        
+    /**
+     * Cluster-wide topic layout from the metadata store, falling back to the partitions this
+     * broker hosts when the store is unreachable (e.g. standalone/test brokers).
+     */
+    public List<TopicDescription> describeTopics() {
         try {
-            List<String> topicList = zkClient.getChildren("/topics");
-            response.putInt(topicList.size());
-            for (String topicName : topicList) {
-                byte[] nameBytes = topicName.getBytes(StandardCharsets.UTF_8);
-                response.putShort((short) nameBytes.length);
-                response.put(nameBytes);
-                
-                String configData = zkClient.getData("/topics/" + topicName);
-                JsonObject config = gson.fromJson(configData, JsonObject.class);
+            List<TopicDescription> result = new ArrayList<>();
+            for (String topicName : zkClient.getChildren("/topics")) {
+                JsonObject config = gson.fromJson(zkClient.getData("/topics/" + topicName), JsonObject.class);
                 int numPartitions = config.get("partitions").getAsInt();
-                
-                response.putInt(numPartitions);
+                List<PartitionDescription> partitions = new ArrayList<>();
                 for (int i = 0; i < numPartitions; i++) {
-                    String stateData = zkClient.getData("/topics/" + topicName + "/partitions/" + i + "/state");
-                    JsonObject state = gson.fromJson(stateData, JsonObject.class);
-                    int leader = state.get("leader").getAsInt();
-                    JsonArray replicas = state.getAsJsonArray("replicas");
-                    
-                    response.putInt(i); // partitionId
-                    response.putInt(leader); // leaderId
-                    response.putInt(replicas.size()); // replicaCount
-                    for (int j = 0; j < replicas.size(); j++) {
-                        response.putInt(replicas.get(j).getAsInt());
-                    }
+                    JsonObject state = gson.fromJson(
+                            zkClient.getData("/topics/" + topicName + "/partitions/" + i + "/state"), JsonObject.class);
+                    List<Integer> replicas = new ArrayList<>();
+                    state.getAsJsonArray("replicas").forEach(e -> replicas.add(e.getAsInt()));
+                    partitions.add(new PartitionDescription(i, state.get("leader").getAsInt(), replicas));
                 }
+                result.add(new TopicDescription(topicName, partitions));
             }
+            return result;
         } catch (Exception e) {
-            response.putInt(0); // topics count
-        }
-        response.flip();
-        while (response.hasRemaining()) {
-            clientChannel.write(response);
-        }
-    }
-
-    private void handleCreateTopicRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        String topic = readString(buffer);
-        int numPartitions = buffer.getInt();
-        short replicationFactor = buffer.getShort();
-        
-        if (isController.get()) {
-            createTopic(topic, numPartitions, replicationFactor);
-            ByteBuffer response = ByteBuffer.allocate(1);
-            response.put(Protocol.CREATE_TOPIC_RESPONSE);
-            response.flip();
-            while (response.hasRemaining()) {
-                clientChannel.write(response);
+            List<TopicDescription> local = new ArrayList<>();
+            for (Map.Entry<String, List<Partition>> entry : topics.entrySet()) {
+                List<PartitionDescription> partitions = new ArrayList<>();
+                for (Partition p : entry.getValue()) {
+                    int leader = p.getLeader() == 0 ? brokerId : p.getLeader();
+                    partitions.add(new PartitionDescription(p.getId(), leader, List.of(leader)));
+                }
+                local.add(new TopicDescription(entry.getKey(), partitions));
             }
-        } else {
-            Protocol.sendErrorResponse(clientChannel, "Not controller");
+            return local;
         }
     }
 
-    private void replicateToFollowers(String topic, Partition partition, byte[] message, long offset, int followerId) {
-        try {
-            BrokerInfo followerInfo = clusterMetadata.get(followerId);
-            if (followerInfo != null) {
-                try (SocketChannel channel = SocketChannel.open(new InetSocketAddress(followerInfo.getHost(), followerInfo.getPort()))) {
-                    ByteBuffer req = Protocol.encodeReplicateRequest(topic, partition.getId(), offset, message);
-                    while (req.hasRemaining()) {
-                        channel.write(req);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to replicate to follower " + followerId, e);
-        }
+    public boolean isController() {
+        return isController.get();
     }
 
-    private void handleReplicateRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        String topic = readString(buffer);
-        int partitionId = buffer.getInt();
-        long offset = buffer.getLong();
-        int messageLength = buffer.getInt();
-        byte[] message = new byte[messageLength];
-        buffer.get(message);
-
-        List<Partition> parts = topics.get(topic);
-        if (parts != null && partitionId < parts.size()) {
-            Partition partition = parts.get(partitionId);
-            partition.append(message);
-        }
-    }
-
-    private void handleTopicNotification(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        String topic = readString(buffer);
-        loadTopic(topic);
-    }
-
-    private String readString(ByteBuffer buffer) {
-        short length = buffer.getShort();
-        byte[] bytes = new byte[length];
-        buffer.get(bytes);
-        return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    private void acceptConnections() {
-        while (isRunning.get()) {
-            try {
-                SocketChannel clientChannel = serverChannel.accept();
-                if (clientChannel != null) {
-                    clientChannel.configureBlocking(true); 
-                    executor.submit(() -> handleClient(clientChannel));
-                }
-                Thread.sleep(10);
-            } catch (Exception e) {
-                if (isRunning.get()) {
-                    LOGGER.log(Level.SEVERE, "Error accepting connection", e);
-                }
-            }
-        }
-    }
-
-    private void handleClient(SocketChannel clientChannel) {
-        try {
-            ByteBuffer buffer = ByteBuffer.allocate(8192);
-            while (clientChannel.isOpen() && isRunning.get()) {
-                buffer.clear();
-                int bytesRead = clientChannel.read(buffer);
-                if (bytesRead > 0) {
-                    buffer.flip();
-                    processClientMessage(clientChannel, buffer);
-                } else if (bytesRead < 0) {
-                    clientChannel.close();
-                    break;
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Client disconnected or error", e);
-        } finally {
-            try {
-                if (clientChannel.isOpen()) {
-                    clientChannel.close();
-                }
-            } catch (IOException e) { }
-        }
-    }
-
-    private void processClientMessage(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-        byte messageType = buffer.get();
-        switch (messageType) {
-            case Protocol.PRODUCE:
-                handleProduceRequest(clientChannel, buffer);
-                break;
-            case Protocol.FETCH:
-                handleFetchRequest(clientChannel, buffer);
-                break;
-            case Protocol.METADATA:
-                handleMetadataRequest(clientChannel, buffer);
-                break;
-            case Protocol.CREATE_TOPIC:
-                handleCreateTopicRequest(clientChannel, buffer);
-                break;
-            case Protocol.REPLICATE:
-                handleReplicateRequest(clientChannel, buffer);
-                break;
-            case Protocol.TOPIC_NOTIFICATION:
-                handleTopicNotification(clientChannel, buffer);
-                break;
-            default:
-                LOGGER.warning("Unknown message type: " + messageType);
-                Protocol.sendErrorResponse(clientChannel, "Unknown message type");
-        }
+    /** Client-facing port: the Netty server's bound port once started (resolves port 0). */
+    public int getPort() {
+        return nettyServer != null ? nettyServer.getPort() : brokerPort;
     }
 
     /**
