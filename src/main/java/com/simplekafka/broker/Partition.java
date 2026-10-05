@@ -2,7 +2,9 @@ package com.simplekafka.broker;
 
 import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
 
+import java.io.DataInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
@@ -11,10 +13,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -37,6 +41,13 @@ public class Partition {
     private static final Logger LOGGER = Logger.getLogger(Partition.class.getName());
     private static final long MAX_SEGMENT_SIZE = 1024 * 1024; // 1MB
     private static final int INDEX_ENTRY_BYTES = 16;
+
+    private static final String COMPACT_LOCK = ".compact.lock";
+    private static final String COMPACT_STAGING = ".compact_staging";
+    private static final String COMPACT_READY = ".compact_ready";
+    private static final String META_FILE = ".partition.meta";
+    private static final short META_MAGIC = 0x504D; // 'PM'
+    private static final byte META_VERSION = 1;
 
     private final int id;
     private final DurabilityMode durabilityMode;
@@ -94,22 +105,20 @@ public class Partition {
 
             File dir = new File(baseDir);
 
-            // Crash recovery: check for incomplete previous compaction
-            File compactLock = new File(baseDir, ".compact.lock");
-            File compactStaging = new File(baseDir, ".compact_staging");
-            if (compactLock.exists() || compactStaging.exists()) {
-                LOGGER.warning("Detected incomplete previous compaction for partition " + id + ". Cleaning up staging files...");
-                if (compactStaging.exists()) {
-                    File[] stagingFiles = compactStaging.listFiles();
-                    if (stagingFiles != null) {
-                        for (File f : stagingFiles) f.delete();
-                    }
-                    compactStaging.delete();
-                }
-                if (compactLock.exists()) {
-                    compactLock.delete();
-                }
+            // Crash recovery for an interrupted compact(): roll forward if the compacted files
+            // reached the commit point (.compact_ready), otherwise roll back (discard staging).
+            File compactLock = new File(baseDir, COMPACT_LOCK);
+            File compactStaging = new File(baseDir, COMPACT_STAGING);
+            File compactReady = new File(baseDir, COMPACT_READY);
+            if (compactReady.exists()) {
+                LOGGER.warning("Partition " + id + ": completing interrupted compaction from " + COMPACT_READY);
+                installCompactedFiles(compactReady);
             }
+            if (compactStaging.exists()) {
+                LOGGER.warning("Partition " + id + ": discarding uncommitted compaction staging files");
+                deleteDirectory(compactStaging);
+            }
+            compactLock.delete();
 
             File[] files = dir.listFiles((d, name) -> name.endsWith(".log"));
             
@@ -130,10 +139,13 @@ public class Partition {
                 SegmentInfo lastSegment = segments.get(segments.size() - 1);
                 // Index entries carry explicit offsets, so this stays correct across compaction gaps
                 long lastOffset = truncateTornTail(lastSegment);
-                nextOffset.set(lastOffset >= 0 ? lastOffset + 1 : lastSegment.baseOffset);
+                long fromIndex = lastOffset >= 0 ? lastOffset + 1 : lastSegment.baseOffset;
+                // .meta covers offsets compaction removed from the tail (e.g. tombstoned keys)
+                nextOffset.set(Math.max(fromIndex, readMetaNextOffset()));
                 openSegmentForAppend(lastSegment);
             } else {
                 createNewSegment(0);
+                nextOffset.set(readMetaNextOffset());
             }
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to initialize partition " + id, e);
@@ -484,15 +496,16 @@ public class Partition {
                 }
             }
 
-            File compactLock = new File(baseDir, ".compact.lock");
-            File compactStaging = new File(baseDir, ".compact_staging");
-            if (compactStaging.exists()) {
-                File[] stagingFiles = compactStaging.listFiles();
-                if (stagingFiles != null) {
-                    for (File f : stagingFiles) f.delete();
-                }
-                compactStaging.delete();
-            }
+            // Crash safety: compacted files are built and fsynced in .compact_staging, then the
+            // directory is atomically renamed to .compact_ready -- the commit point. A crash before
+            // the rename rolls back (initialize() discards staging; the original files are untouched).
+            // A crash after it rolls forward (initialize() re-runs installCompactedFiles(), which is
+            // idempotent). Individual file swaps are not atomic as a group, which is why recovery
+            // must never discard .compact_ready.
+            File compactLock = new File(baseDir, COMPACT_LOCK);
+            File compactStaging = new File(baseDir, COMPACT_STAGING);
+            File compactReady = new File(baseDir, COMPACT_READY);
+            deleteDirectory(compactStaging);
             compactStaging.mkdirs();
             compactLock.createNewFile();
 
@@ -501,7 +514,6 @@ public class Partition {
             File stagedLog = new File(compactStaging, stagedLogName);
             File stagedIndex = new File(compactStaging, stagedIndexName);
 
-            long maxOffsetSeen = -1;
             try {
                 try (RandomAccessFile sLogRaf = new RandomAccessFile(stagedLog, "rw");
                      FileChannel sLogCh = sLogRaf.getChannel();
@@ -510,7 +522,10 @@ public class Partition {
 
                     long curPos = 0;
                     ByteBuffer idxBuf = ByteBuffer.allocate(16);
-                    for (CompactedRecord record : latestByKey.values()) {
+                    // Offset order, not key first-seen order: findPositionForOffset binary-searches the index
+                    List<CompactedRecord> survivors = new ArrayList<>(latestByKey.values());
+                    survivors.sort(Comparator.comparingLong(CompactedRecord::offset));
+                    for (CompactedRecord record : survivors) {
                         byte[] msg = record.payload();
                         ByteBuffer logBuf = ByteBuffer.allocate(4 + msg.length);
                         logBuf.putInt(msg.length);
@@ -528,14 +543,17 @@ public class Partition {
                             sIdxCh.write(idxBuf);
                         }
                         curPos += (4 + msg.length);
-
-                        if (record.offset() > maxOffsetSeen) {
-                            maxOffsetSeen = record.offset();
-                        }
                     }
                     sLogCh.force(true);
                     sIdxCh.force(true);
                 }
+
+                // Compaction may drop the highest offsets (tombstoned keys); persist nextOffset
+                // first so a restart never reissues them.
+                writeMetaNextOffset(nextOffset.get());
+
+                Files.move(compactStaging.toPath(), compactReady.toPath(), StandardCopyOption.ATOMIC_MOVE);
+                fsyncDirectory(new File(baseDir));
 
                 if (activeLogChannel != null) {
                     activeLogChannel.close();
@@ -546,39 +564,104 @@ public class Partition {
                     activeIndexFile.close();
                 }
 
-                File dir = new File(baseDir);
-                File[] oldFiles = dir.listFiles((d, name) -> name.endsWith(".log") || name.endsWith(".index"));
-                if (oldFiles != null) {
-                    for (File f : oldFiles) {
-                        f.delete();
-                    }
-                }
-
-                File destLog = new File(baseDir, stagedLogName);
-                File destIndex = new File(baseDir, stagedIndexName);
-                Files.move(stagedLog.toPath(), destLog.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-                Files.move(stagedIndex.toPath(), destIndex.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-
-                compactStaging.delete();
-                compactLock.delete();
+                installCompactedFiles(compactReady);
 
                 segments.clear();
-                long count = destIndex.length() / 16;
+                File destLog = new File(baseDir, stagedLogName);
+                File destIndex = new File(baseDir, stagedIndexName);
+                long count = destIndex.length() / INDEX_ENTRY_BYTES;
                 SegmentInfo newSeg = new SegmentInfo(0L, destLog, destIndex, count);
                 segments.add(newSeg);
                 openSegmentForAppend(newSeg);
-
-                if (maxOffsetSeen >= 0) {
-                    nextOffset.set(maxOffsetSeen + 1);
-                }
+                // nextOffset is deliberately unchanged: offsets are never reissued
             } finally {
-                if (compactLock.exists()) {
-                    compactLock.delete();
-                }
+                compactLock.delete();
             }
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Moves committed compaction output into the partition directory. Idempotent, so recovery
+     * can re-run it after a crash at any point: segment files that compaction doesn't replace
+     * are deleted, then each file still in {@code readyDir} is moved over its target.
+     */
+    private void installCompactedFiles(File readyDir) throws IOException {
+        File dir = new File(baseDir);
+        Set<String> compactedNames = Set.of(String.format("%020d.log", 0L), String.format("%020d.index", 0L));
+        File[] oldFiles = dir.listFiles((d, name) ->
+                (name.endsWith(".log") || name.endsWith(".index")) && !compactedNames.contains(name));
+        if (oldFiles != null) {
+            for (File f : oldFiles) {
+                Files.deleteIfExists(f.toPath());
+            }
+        }
+        File[] readyFiles = readyDir.listFiles();
+        if (readyFiles != null) {
+            for (File f : readyFiles) {
+                Files.move(f.toPath(), new File(dir, f.getName()).toPath(),
+                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        Files.deleteIfExists(readyDir.toPath());
+        fsyncDirectory(dir);
+    }
+
+    private void writeMetaNextOffset(long value) throws IOException {
+        File tmp = new File(baseDir, META_FILE + ".tmp");
+        try (FileChannel ch = FileChannel.open(tmp.toPath(), StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            ByteBuffer buf = ByteBuffer.allocate(2 + 1 + 8);
+            buf.putShort(META_MAGIC);
+            buf.put(META_VERSION);
+            buf.putLong(value);
+            buf.flip();
+            while (buf.hasRemaining()) {
+                ch.write(buf);
+            }
+            ch.force(true);
+        }
+        Files.move(tmp.toPath(), new File(baseDir, META_FILE).toPath(),
+                StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** @return persisted nextOffset floor, or 0 if there is no usable .meta file */
+    private long readMetaNextOffset() {
+        File meta = new File(baseDir, META_FILE);
+        if (!meta.exists()) {
+            return 0;
+        }
+        try (DataInputStream in = new DataInputStream(new FileInputStream(meta))) {
+            short magic = in.readShort();
+            byte version = in.readByte();
+            if (magic != META_MAGIC || version != META_VERSION) {
+                LOGGER.warning("Partition " + id + ": ignoring unrecognized " + META_FILE);
+                return 0;
+            }
+            return in.readLong();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Partition " + id + ": failed to read " + META_FILE, e);
+            return 0;
+        }
+    }
+
+    private static void fsyncDirectory(File dir) {
+        try (FileChannel ch = FileChannel.open(dir.toPath(), StandardOpenOption.READ)) {
+            ch.force(true);
+        } catch (IOException e) {
+            // Directory fsync isn't supported on every platform; renames stay atomic, just not yet durable
+        }
+    }
+
+    private static void deleteDirectory(File dir) {
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File f : files) {
+                f.delete();
+            }
+        }
+        dir.delete();
     }
 
     private List<CompactedRecord> readAllRecordsWithOffsets() throws IOException {
