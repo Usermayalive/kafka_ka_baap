@@ -1,5 +1,7 @@
 package com.simplekafka.broker;
 
+import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -19,11 +21,25 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+/**
+ * A single partition log: 1MB segments of [length:4][payload] records plus a dense
+ * (offset, position) index that preserves offset gaps left by compaction.
+ *
+ * DURABILITY (see docs/durability.md):
+ * - OS_PAGE_CACHE (default, Kafka's default): append() returns once the record is in the
+ *   kernel page cache. Survives a broker process crash; an OS crash / power loss can lose
+ *   the unflushed tail, which is truncated back to a clean record boundary on restart.
+ * - PHYSICAL_FSYNC: append() returns only after the record is fsynced. Concurrent appenders
+ *   share one log+index force() (group commit), so throughput scales with concurrency
+ *   instead of being capped at one fsync pair per message.
+ */
 public class Partition {
     private static final Logger LOGGER = Logger.getLogger(Partition.class.getName());
     private static final long MAX_SEGMENT_SIZE = 1024 * 1024; // 1MB
+    private static final int INDEX_ENTRY_BYTES = 16;
 
     private final int id;
+    private final DurabilityMode durabilityMode;
     private int leader;
     private List<Integer> followers;
     private final String baseDir;
@@ -35,8 +51,18 @@ public class Partition {
     private FileChannel activeIndexChannel;
     private final List<SegmentInfo> segments;
 
+    // Group commit state (PHYSICAL_FSYNC only), guarded by flushMonitor
+    private final Object flushMonitor = new Object();
+    private long durableUpToOffset = -1;
+    private boolean flushInProgress = false;
+
     public Partition(int id, String topicBaseDir) {
+        this(id, topicBaseDir, DurabilityMode.OS_PAGE_CACHE);
+    }
+
+    public Partition(int id, String topicBaseDir, DurabilityMode durabilityMode) {
         this.id = id;
+        this.durabilityMode = durabilityMode;
         this.baseDir = topicBaseDir + File.separator + "partition-" + id;
         this.nextOffset = new AtomicLong(0);
         this.lock = new ReentrantReadWriteLock();
@@ -102,7 +128,9 @@ public class Partition {
                 segments.sort(Comparator.comparingLong(s -> s.baseOffset));
                 
                 SegmentInfo lastSegment = segments.get(segments.size() - 1);
-                nextOffset.set(lastSegment.baseOffset + lastSegment.currentMessageCount);
+                // Index entries carry explicit offsets, so this stays correct across compaction gaps
+                long lastOffset = truncateTornTail(lastSegment);
+                nextOffset.set(lastOffset >= 0 ? lastOffset + 1 : lastSegment.baseOffset);
                 openSegmentForAppend(lastSegment);
             } else {
                 createNewSegment(0);
@@ -110,6 +138,48 @@ public class Partition {
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to initialize partition " + id, e);
             throw new RuntimeException("Failed to initialize partition", e);
+        }
+    }
+
+    /**
+     * Without a per-message fsync, an OS crash can persist the log and index tails
+     * independently. Drops index entries whose record isn't fully in the log, then truncates
+     * the log after the last indexed record so readMessages() never scans orphaned bytes.
+     *
+     * @return offset of the last intact record, or -1 if the segment is empty
+     */
+    private long truncateTornTail(SegmentInfo segment) throws IOException {
+        try (RandomAccessFile log = new RandomAccessFile(segment.logFile, "rw");
+             RandomAccessFile index = new RandomAccessFile(segment.indexFile, "rw")) {
+            long entries = index.length() / INDEX_ENTRY_BYTES;
+            long validLogEnd = 0;
+            long lastOffset = -1;
+            while (entries > 0) {
+                index.seek((entries - 1) * INDEX_ENTRY_BYTES);
+                long offset = index.readLong();
+                long position = index.readLong();
+                if (position >= 0 && position + 4 <= log.length()) {
+                    log.seek(position);
+                    long recordEnd = position + 4 + log.readInt();
+                    if (recordEnd >= position + 4 && recordEnd <= log.length()) {
+                        validLogEnd = recordEnd;
+                        lastOffset = offset;
+                        break;
+                    }
+                }
+                entries--;
+            }
+
+            long validIndexEnd = entries * INDEX_ENTRY_BYTES;
+            if (index.length() != validIndexEnd || log.length() != validLogEnd) {
+                LOGGER.warning("Partition " + id + ": truncating torn tail of " + segment.logFile.getName() +
+                        " (log " + log.length() + " -> " + validLogEnd +
+                        " bytes, index " + index.length() + " -> " + validIndexEnd + " bytes)");
+                index.setLength(validIndexEnd);
+                log.setLength(validLogEnd);
+            }
+            segment.currentMessageCount = entries;
+            return lastOffset;
         }
     }
 
@@ -129,11 +199,20 @@ public class Partition {
     }
 
     private void openSegmentForAppend(SegmentInfo segment) throws IOException {
+        // Rolling away from a segment: force it first so records still awaiting group commit
+        // are durable before the channel the flush leader would force is closed.
+        boolean forceOnClose = durabilityMode == DurabilityMode.PHYSICAL_FSYNC;
         if (activeLogChannel != null) {
+            if (forceOnClose && activeLogChannel.isOpen()) {
+                activeLogChannel.force(true);
+            }
             activeLogChannel.close();
             activeLogFile.close();
         }
         if (activeIndexChannel != null) {
+            if (forceOnClose && activeIndexChannel.isOpen()) {
+                activeIndexChannel.force(true);
+            }
             activeIndexChannel.close();
             activeIndexFile.close();
         }
@@ -148,6 +227,14 @@ public class Partition {
     }
 
     public long append(byte[] message) throws IOException {
+        long offset = appendToPageCache(message);
+        if (durabilityMode == DurabilityMode.PHYSICAL_FSYNC) {
+            awaitDurable(offset);
+        }
+        return offset;
+    }
+
+    private long appendToPageCache(byte[] message) throws IOException {
         lock.writeLock().lock();
         try {
             if (activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
@@ -166,7 +253,6 @@ public class Partition {
             while (buffer.hasRemaining()) {
                 activeLogChannel.write(buffer);
             }
-            activeLogChannel.force(true);
 
             // Update index file
             updateIndex(currentOffset, currentPosition);
@@ -191,7 +277,56 @@ public class Partition {
         while (indexBuffer.hasRemaining()) {
             activeIndexChannel.write(indexBuffer);
         }
-        activeIndexChannel.force(true);
+    }
+
+    /**
+     * Group commit: blocks until {@code offset} is fsynced. The first waiter becomes the flush
+     * leader and forces log+index once, covering every record appended before the force began;
+     * the rest wait for that flush instead of issuing their own.
+     */
+    private void awaitDurable(long offset) throws IOException {
+        while (true) {
+            synchronized (flushMonitor) {
+                while (durableUpToOffset < offset && flushInProgress) {
+                    try {
+                        flushMonitor.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted while waiting for fsync", e);
+                    }
+                }
+                if (durableUpToOffset >= offset) {
+                    return;
+                }
+                flushInProgress = true;
+            }
+
+            long flushedUpTo = -1;
+            IOException failure = null;
+            // Read lock: excludes segment rolls and compaction (which close channels) while
+            // forcing; appenders queue on the write lock and join the next flush.
+            lock.readLock().lock();
+            try {
+                flushedUpTo = nextOffset.get() - 1;
+                activeLogChannel.force(true);
+                activeIndexChannel.force(true);
+            } catch (IOException e) {
+                failure = e;
+            } finally {
+                lock.readLock().unlock();
+            }
+
+            synchronized (flushMonitor) {
+                flushInProgress = false;
+                if (failure == null) {
+                    durableUpToOffset = Math.max(durableUpToOffset, flushedUpTo);
+                }
+                flushMonitor.notifyAll();
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
     }
 
     public List<byte[]> readMessages(long offset, int maxBytes) throws IOException {
@@ -466,35 +601,6 @@ public class Partition {
             }
         }
         return list;
-    }
-
-    private void appendRecordWithOffsetInternal(long offset, byte[] message) throws IOException {
-        if (activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
-            createNewSegment(offset);
-        }
-
-        long currentPosition = activeLogChannel.position();
-
-        ByteBuffer buffer = ByteBuffer.allocate(4 + message.length);
-        buffer.putInt(message.length);
-        buffer.put(message);
-        buffer.flip();
-
-        while (buffer.hasRemaining()) {
-            activeLogChannel.write(buffer);
-        }
-        activeLogChannel.force(true);
-
-        updateIndex(offset, currentPosition);
-
-        SegmentInfo activeSegment = segments.get(segments.size() - 1);
-        activeSegment.currentMessageCount++;
-    }
-
-    private void appendRecordInternal(byte[] message) throws IOException {
-        long currentOffset = nextOffset.get();
-        appendRecordWithOffsetInternal(currentOffset, message);
-        nextOffset.incrementAndGet();
     }
 
     public int getId() { return id; }
