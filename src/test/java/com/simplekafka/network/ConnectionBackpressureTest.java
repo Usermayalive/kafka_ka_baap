@@ -53,13 +53,13 @@ public class ConnectionBackpressureTest {
         CountDownLatch stall = new CountDownLatch(1);
         Partition slowPartition = new Partition(0, tempDir.getAbsolutePath()) {
             @Override
-            public long append(byte[] message) throws IOException {
+            public long appendBuffered(byte[] message) throws IOException {
                 try {
                     stall.await(30, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                return super.append(message);
+                return super.appendBuffered(message);
             }
         };
         SimpleKafkaBroker broker = new SimpleKafkaBroker(1, "localhost", 0, 2181) {

@@ -8,6 +8,7 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -238,15 +239,20 @@ public class Partition {
         activeIndexChannel.position(activeIndexChannel.size());
     }
 
+    /** Appends and returns once the record meets this partition's durability mode. */
     public long append(byte[] message) throws IOException {
-        long offset = appendToPageCache(message);
-        if (durabilityMode == DurabilityMode.PHYSICAL_FSYNC) {
-            awaitDurable(offset);
-        }
+        long offset = appendBuffered(message);
+        awaitDurable(offset);
         return offset;
     }
 
-    private long appendToPageCache(byte[] message) throws IOException {
+    /**
+     * Appends to the page cache and returns the offset without waiting for fsync. The caller
+     * must call {@link #awaitDurable(long)} before acknowledging the write. Lets callers that
+     * hold their own lock (e.g. idempotence bookkeeping) release it before the fsync wait, so
+     * concurrent producers still share one group commit.
+     */
+    public long appendBuffered(byte[] message) throws IOException {
         lock.writeLock().lock();
         try {
             if (activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
@@ -296,7 +302,10 @@ public class Partition {
      * leader and forces log+index once, covering every record appended before the force began;
      * the rest wait for that flush instead of issuing their own.
      */
-    private void awaitDurable(long offset) throws IOException {
+    public void awaitDurable(long offset) throws IOException {
+        if (durabilityMode != DurabilityMode.PHYSICAL_FSYNC) {
+            return;
+        }
         while (true) {
             synchronized (flushMonitor) {
                 while (durableUpToOffset < offset && flushInProgress) {
@@ -313,19 +322,31 @@ public class Partition {
                 flushInProgress = true;
             }
 
-            long flushedUpTo = -1;
-            IOException failure = null;
-            // Read lock: excludes segment rolls and compaction (which close channels) while
-            // forcing; appenders queue on the write lock and join the next flush.
+            long flushedUpTo;
+            FileChannel logChannel;
+            FileChannel indexChannel;
+            // Snapshot under the lock, force outside it: holding the lock across the ~ms fsync
+            // would stall appenders, so each flush would cover only the one record queued
+            // behind it instead of everything appended meanwhile.
             lock.readLock().lock();
             try {
                 flushedUpTo = nextOffset.get() - 1;
-                activeLogChannel.force(true);
-                activeIndexChannel.force(true);
-            } catch (IOException e) {
-                failure = e;
+                logChannel = activeLogChannel;
+                indexChannel = activeIndexChannel;
             } finally {
                 lock.readLock().unlock();
+            }
+
+            IOException failure = null;
+            try {
+                logChannel.force(true);
+                indexChannel.force(true);
+            } catch (ClosedChannelException e) {
+                // The segment rolled (rolls force before closing in PHYSICAL_FSYNC mode) or was
+                // replaced by compaction output that is fsynced before install. Either way the
+                // snapshotted records are already on disk.
+            } catch (IOException e) {
+                failure = e;
             }
 
             synchronized (flushMonitor) {

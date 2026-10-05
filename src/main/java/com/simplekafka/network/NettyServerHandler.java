@@ -177,9 +177,13 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
 
         // 3. Idempotent Sequence & Epoch Verification
         try {
+            // Only the page-cache write happens under the idempotence lock; the fsync wait (if any)
+            // happens after it is released so concurrent producers share one group commit. A
+            // duplicate also waits: its original may still be awaiting the same flush.
             IdempotenceManager.IdempotentResult result = idempotenceManager.verifyAndApply(
-                    topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.append(message)
+                    topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.appendBuffered(message)
             );
+            partition.awaitDurable(result.offset());
 
             return produceResponse(frame, topic, partitionId, result.offset(), result.isDuplicate());
         } catch (ProducerFencedException pfe) {

@@ -84,9 +84,9 @@ public class Phase3NetworkingAndIdempotenceTest {
 
         Partition instrumentedPartition = new Partition(0, new File(tempDir, "isolated").getAbsolutePath()) {
             @Override
-            public long append(byte[] message) throws java.io.IOException {
+            public long appendBuffered(byte[] message) throws java.io.IOException {
                 handlingThreadName.set(Thread.currentThread().getName());
-                return super.append(message);
+                return super.appendBuffered(message);
             }
         };
         broker.getTopics().put("isolated-orders", new ArrayList<>(List.of(instrumentedPartition)));
@@ -492,14 +492,14 @@ public class Phase3NetworkingAndIdempotenceTest {
 
         Partition slowPartition = new Partition(0, new File(tempDir, "overload-part").getAbsolutePath()) {
             @Override
-            public long append(byte[] message) throws java.io.IOException {
+            public long appendBuffered(byte[] message) throws java.io.IOException {
                 reachedLatch.countDown();
                 try {
                     blockingLatch.await(5, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                return super.append(message);
+                return super.appendBuffered(message);
             }
         };
 

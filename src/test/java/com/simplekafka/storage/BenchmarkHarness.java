@@ -113,14 +113,18 @@ public class BenchmarkHarness {
             System.out.println();
 
             // -------------------------------------------------------------
-            // SCENARIO 4: Idempotence Pipeline Throughput (Batched vs Unbatched Snapshots)
+            // SCENARIO 4: End-to-end through the broker (Netty -> idempotence -> Partition)
+            // Scenarios 2-3 measure WriteAheadLog in isolation; the broker does not use it.
+            // This is the number that belongs in the README. Full matrix: BrokerBenchmark.main.
             // -------------------------------------------------------------
-            System.out.println("--- Scenario 4: Idempotence Deduplication Pipeline Throughput ---");
-            System.out.println("Configuration                   | Total Msgs | Elapsed | Throughput    | Bandwidth   | p50 Lat | p99 Lat");
-            System.out.println("--------------------------------------------------------------------------------------------------");
-            runIdempotenceBenchmark(new File(baseDir, "wal-non-idem"), 64, 50_000, false, 100);
-            runIdempotenceBenchmark(new File(baseDir, "wal-idem-batched-100"), 64, 50_000, true, 100);
-            runIdempotenceBenchmark(new File(baseDir, "wal-idem-unbatched-1"), 64, 2_000, true, 1);
+            System.out.println("--- Scenario 4: End-to-End Broker Produce Path (1 KB, single partition) ---");
+            for (WriteAheadLog.DurabilityMode mode : WriteAheadLog.DurabilityMode.values()) {
+                for (boolean idempotent : new boolean[]{false, true}) {
+                    BrokerBenchmark.Result r = BrokerBenchmark.run(new BrokerBenchmark.Config(mode, idempotent, 16, 16, 1024));
+                    System.out.printf("%-15s idempotent=%-5b 16 conns x 16 in-flight | %,10.0f op/s | p50 %6.2f ms | p99 %6.2f ms%n",
+                            mode, idempotent, r.opsPerSec(), r.p50Ms(), r.p99Ms());
+                }
+            }
 
             System.out.println("==========================================================================================");
 
@@ -165,56 +169,6 @@ public class BenchmarkHarness {
                     label, count, (overallElapsedNanos / 1_000_000), opsPerSec, mbPerSec,
                     p50Us / 1000.0, p95Us / 1000.0, p99Us / 1000.0);
         }
-    }
-
-    private static void runIdempotenceBenchmark(File walDir, int payloadSize, int count, boolean idempotent, int snapshotInterval) throws Exception {
-        walDir.mkdirs();
-        byte[] payload = new byte[payloadSize];
-        Arrays.fill(payload, (byte) 0x2A);
-
-        com.simplekafka.broker.Partition partition = new com.simplekafka.broker.Partition(0, walDir.getAbsolutePath());
-        com.simplekafka.network.IdempotenceManager idem = idempotent ? new com.simplekafka.network.IdempotenceManager(snapshotInterval) : null;
-        if (idem != null) {
-            idem.registerPartitionDir("bench-topic", 0, walDir);
-        }
-
-        long[] latenciesNs = new long[count];
-        long overallStart = System.nanoTime();
-
-        for (int i = 0; i < count; i++) {
-            long start = System.nanoTime();
-            if (idem != null) {
-                idem.verifyAndApply("bench-topic", 0, 999L, (short) 0, i, () -> partition.append(payload));
-            } else {
-                partition.append(payload);
-            }
-            latenciesNs[i] = System.nanoTime() - start;
-        }
-
-        if (idem != null) {
-            idem.flushSnapshots();
-        }
-
-        long overallElapsedNanos = System.nanoTime() - overallStart;
-        double elapsedSec = overallElapsedNanos / 1_000_000_000.0;
-        double opsPerSec = count / elapsedSec;
-        long totalBytes = (long) count * (4 + payloadSize);
-        double mbPerSec = (totalBytes / (1024.0 * 1024.0)) / elapsedSec;
-
-        Arrays.sort(latenciesNs);
-        double p50Us = latenciesNs[(int) (count * 0.50)] / 1000.0;
-        double p99Us = latenciesNs[(int) (count * 0.99)] / 1000.0;
-
-        String label;
-        if (!idempotent) {
-            label = "Non-idempotent (baseline)";
-        } else {
-            label = "Idempotent (snap=" + snapshotInterval + ")";
-        }
-
-        System.out.printf("%-32s| %,10d | %5d ms | %,11.0f op/s | %9.2f MB/s | %5.2f ms | %5.2f ms%n",
-                label, count, (overallElapsedNanos / 1_000_000), opsPerSec, mbPerSec,
-                p50Us / 1000.0, p99Us / 1000.0);
     }
 
     private static void deleteRecursively(File dir) {
