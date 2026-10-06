@@ -274,32 +274,49 @@ public class SimpleKafkaClient implements AutoCloseable {
         return layout;
     }
 
-    private static final int LEADER_RETRIES = 10;
-    private static final long LEADER_RETRY_BACKOFF_MS = 200;
+    /**
+     * How long to keep retrying while partition leadership is moving or the leader is catching
+     * up after a restart (a restarted ex-leader may need seconds to replay a divergent log).
+     * Kafka clients similarly retry until delivery.timeout.ms (2 minutes by default).
+     */
+    private volatile long leaderRetryDeadlineMs = 30_000;
+    private static final long LEADER_RETRY_MAX_BACKOFF_MS = 1_000;
 
-    /** Sends to the partition leader; on a leadership error refreshes metadata and retries. */
+    /** How long produce/fetch keep retrying leadership errors before failing (default 30 s). */
+    public void setLeaderRetryDeadlineMs(long leaderRetryDeadlineMs) {
+        this.leaderRetryDeadlineMs = leaderRetryDeadlineMs;
+    }
+
+    /** Sends to the partition leader; on a leadership error refreshes metadata and retries until a deadline. */
     private DataInputStream leaderRequest(String topic, int partition, short apiKey, byte[] request) throws IOException {
-        for (int attempt = 0; ; attempt++) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(leaderRetryDeadlineMs);
+        long backoffMs = 200;
+        while (true) {
             try {
                 return leaderConnection(topic, partition).request(apiKey, request);
             } catch (BrokerErrorException e) {
                 boolean leadershipMoved = e.getErrorCode() == KafkaFrame.ERROR_NOT_LEADER
                         || e.getErrorCode() == KafkaFrame.ERROR_LEADER_NOT_AVAILABLE;
-                if (!leadershipMoved || attempt >= LEADER_RETRIES) {
+                if (!leadershipMoved || System.nanoTime() > deadline) {
                     throw e;
                 }
             } catch (IOException e) {
-                if (attempt >= LEADER_RETRIES) {
-                    throw e; // leader unreachable; metadata may name a new one shortly
+                if (System.nanoTime() > deadline) {
+                    throw e; // leader unreachable and metadata never named a new one
                 }
             }
             try {
-                Thread.sleep(LEADER_RETRY_BACKOFF_MS);
+                Thread.sleep(backoffMs);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrupted while waiting for partition leadership", ie);
             }
-            refreshMetadata();
+            backoffMs = Math.min(backoffMs * 2, LEADER_RETRY_MAX_BACKOFF_MS);
+            try {
+                refreshMetadata();
+            } catch (IOException refreshFailed) {
+                // bootstrap broker may be the one that's down; keep retrying until the deadline
+            }
         }
     }
 

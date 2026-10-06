@@ -128,6 +128,11 @@ public class MetadataStateMachine extends BaseStateMachine {
             MetadataCommand command = MetadataCommand.fromBytes(data);
             change = image.apply(command);
             reply = "OK";
+            if (command.type == MetadataCommand.Type.REGISTER_BROKER) {
+                // A (re-)registration starts a fresh liveness window: never judge a new
+                // incarnation by heartbeats its predecessor missed
+                lastHeartbeat.put(command.brokerId, System.nanoTime());
+            }
             notifier.execute(() -> commandListeners.forEach(l -> safely(() -> l.accept(command))));
         } catch (IllegalStateException e) {
             reply = "ERR " + e.getMessage(); // deterministic rejection, identical on every node

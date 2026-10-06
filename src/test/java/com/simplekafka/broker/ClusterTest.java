@@ -122,6 +122,20 @@ public class ClusterTest {
     }
 
     @Test
+    void testBrokerFencedWhileAliveReRegistersItself() throws Exception {
+        startThreeBrokerCluster();
+        SimpleKafkaBroker anyBroker = brokers.get(1);
+        var registration = anyBroker.getMetadataLog().image().brokers().get(2);
+        // Simulate the leader fencing broker 2 (e.g. after a long GC pause) while it's still running
+        anyBroker.getMetadataLog().quorum().submit(
+                com.simplekafka.metadata.MetadataCommand.unregisterBroker(2, registration.incarnation()));
+        await("broker 2 re-registers itself", 10_000,
+                () -> anyBroker.getMetadataLog().image().brokers().containsKey(2));
+        Thread.sleep(MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS + 1_000);
+        assertTrue(anyBroker.getMetadataLog().image().brokers().containsKey(2), "and stays registered (heartbeats flow)");
+    }
+
+    @Test
     void testClusterSurvivesBrokerCrashAndRecoversItsPartitions() throws Exception {
         startThreeBrokerCluster();
 
@@ -177,6 +191,10 @@ public class ClusterTest {
                 brokers.put(victimId, restarted);
                 await("partition back online on restarted broker", 15_000,
                         () -> leaderOf(survivor, "orders", offlinePartition) == victimId);
+                // It must stay registered: heartbeats from the restarted broker reach the leader
+                Thread.sleep(MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS + 2_000);
+                assertEquals(victimId, leaderOf(survivor, "orders", offlinePartition),
+                        "Restarted broker was fenced again after re-registering");
                 survivorClient.refreshMetadata();
                 List<SimpleKafkaClient.FetchedRecord> recovered =
                         survivorClient.fetchRecords("orders", offlinePartition, 0, 1 << 20);

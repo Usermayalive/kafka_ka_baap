@@ -77,6 +77,17 @@ public class SimpleKafkaBroker {
      * every earlier erasure, leadership change and schema before serving produce or fetch.
      */
     private volatile boolean servingReady = true;
+    /**
+     * Metadata watch callbacks run here, one at a time, never on the metadata-notifier thread:
+     * controller reactions make blocking Raft writes, which must not stall later notifications.
+     * Callbacks re-read the image when they run, so a queued callback can't apply stale state.
+     */
+    private final java.util.concurrent.ExecutorService controllerEvents =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "controller-events");
+                t.setDaemon(true);
+                return t;
+            });
     // Used when running without a metadata quorum (standalone/tests); the quorum's image otherwise
     private final MetadataImage localImage = new MetadataImage();
     private final SchemaService schemaService = new SchemaService(this::metadataImage);
@@ -131,7 +142,7 @@ public class SimpleKafkaBroker {
         zkClient = new MetadataLog(new MetadataQuorum(self, voters, joinQuorumAsLearner,
                 new File(dataDir(), "__metadata"), MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS));
         zkClient.connect();
-        zkClient.onPartitionStateChange(this::reloadAllTopics);
+        zkClient.onPartitionStateChange(() -> controllerEvents.execute(this::reloadAllTopics));
         zkClient.quorum().stateMachine().onCommand(this::onMetadataCommand);
         zkClient.quorum().stateMachine().onChange(change -> {
             if (change == MetadataImage.Change.SCHEMAS) {
@@ -157,6 +168,7 @@ public class SimpleKafkaBroker {
                 adminServer.close();
             }
             groupCoordinator.close();
+            controllerEvents.shutdownNow();
             if (zkClient != null) {
                 zkClient.close();
             }
@@ -167,32 +179,51 @@ public class SimpleKafkaBroker {
     }
 
     private void registerWithZookeeper() {
-        try {
-            JsonObject brokerData = new JsonObject();
-            brokerData.addProperty("host", brokerHost);
-            brokerData.addProperty("port", getPort()); // bound port (brokerPort may be 0)
-            brokerData.add("endpoints", new JsonArray());
-            
-            String path = "/brokers/ids/" + brokerId;
-            // Ensure parent directories exist
-            zkClient.createPath("/brokers");
-            zkClient.createPath("/brokers/ids");
-            zkClient.createEphemeralNode(path, gson.toJson(brokerData)); // returns once applied locally
-            reconcileForgottenEntities();
-            servingReady = true;
-            
-            // Watch for cluster changes
-            zkClient.watchChildren("/brokers/ids", this::onBrokersChanged);
-            
-            // Watch for topics
-            zkClient.watchChildren("/topics", this::onTopicsChanged);
-        } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failed to register with Zookeeper", e);
+        JsonObject brokerData = new JsonObject();
+        brokerData.addProperty("host", brokerHost);
+        brokerData.addProperty("port", getPort()); // bound port (brokerPort may be 0)
+        brokerData.add("endpoints", new JsonArray());
+        String path = "/brokers/ids/" + brokerId;
+        zkClient.createPath("/brokers");
+        zkClient.createPath("/brokers/ids");
+
+        // Retry until registered. A transient failure must not leave a running broker
+        // unregistered forever: e.g. a restarted ex-leader can need longer than one attempt's
+        // wait to catch up on a divergent log before its registration applies locally.
+        long backoffMs = 500;
+        while (isRunning.get()) {
+            try {
+                zkClient.createEphemeralNode(path, gson.toJson(brokerData)); // returns once applied locally
+                break;
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Broker " + brokerId + " registration not complete (" + e.getMessage()
+                        + "); retrying in " + backoffMs + " ms");
+                try {
+                    Thread.sleep(backoffMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                backoffMs = Math.min(backoffMs * 2, 5_000);
+            }
         }
+        reconcileForgottenEntities();
+        servingReady = true;
+
+        zkClient.watchChildren("/brokers/ids",
+                ignored -> controllerEvents.execute(() -> onBrokersChanged(zkClient.getChildren("/brokers/ids"))));
+        zkClient.watchChildren("/topics",
+                ignored -> controllerEvents.execute(() -> onTopicsChanged(zkClient.getChildren("/topics"))));
     }
 
     private void onBrokersChanged(List<String> brokerIds) {
         LOGGER.info("Brokers changed: " + brokerIds);
+        if (isRunning.get() && servingReady && !brokerIds.contains(String.valueOf(brokerId))) {
+            // Fenced while alive (missed heartbeats, e.g. a long GC pause or network blip):
+            // re-register, as a ZooKeeper client re-creates its ephemeral node after expiry
+            LOGGER.warning("Broker " + brokerId + " was unregistered while running; re-registering");
+            new Thread(this::reRegister, "broker-reregister").start();
+        }
         try {
             Map<Integer, BrokerInfo> newMetadata = new ConcurrentHashMap<>();
             for (String idStr : brokerIds) {
@@ -211,6 +242,17 @@ public class SimpleKafkaBroker {
             }
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error processing broker changes", e);
+        }
+    }
+
+    private void reRegister() {
+        try {
+            JsonObject brokerData = new JsonObject();
+            brokerData.addProperty("host", brokerHost);
+            brokerData.addProperty("port", getPort());
+            zkClient.createEphemeralNode("/brokers/ids/" + brokerId, gson.toJson(brokerData));
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Re-registration failed; will retry on the next membership change", e);
         }
     }
 
@@ -234,7 +276,7 @@ public class SimpleKafkaBroker {
                 LOGGER.info("Broker " + brokerId + " became controller");
                 rebalancePartitions();
             }
-            zkClient.watchNode(controllerPath, this::onControllerChange);
+            zkClient.watchNode(controllerPath, () -> controllerEvents.execute(this::onControllerChange));
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Controller election failed", e);
         }
@@ -290,7 +332,10 @@ public class SimpleKafkaBroker {
             zkClient.createPath("/topics/" + topic + "/partitions");
 
             List<Partition> topicPartitions = new ArrayList<>();
-            List<Integer> availableBrokers = new ArrayList<>(clusterMetadata.keySet());
+            // The replicated image is fresher than clusterMetadata (filled asynchronously by watches)
+            List<Integer> availableBrokers = new ArrayList<>(zkClient != null
+                    ? zkClient.image().brokers().keySet() : clusterMetadata.keySet());
+            java.util.Collections.sort(availableBrokers);
             if (availableBrokers.isEmpty()) {
                 availableBrokers.add(brokerId);
             }
@@ -614,6 +659,13 @@ public class SimpleKafkaBroker {
 
     /** Brokers currently registered in cluster metadata; just this broker when running standalone. */
     public List<BrokerInfo> liveBrokers() {
+        if (zkClient != null) { // the replicated image is the source of truth; clusterMetadata is a derived cache
+            List<BrokerInfo> live = new ArrayList<>();
+            zkClient.image().brokers().values().forEach(b -> live.add(new BrokerInfo(b.id(), b.host(), b.port())));
+            if (!live.isEmpty()) {
+                return live;
+            }
+        }
         if (clusterMetadata.isEmpty()) {
             return List.of(new BrokerInfo(brokerId, brokerHost, getPort()));
         }

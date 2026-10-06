@@ -113,9 +113,12 @@ public class MetadataLog {
         if (parts.length == 3 && parts[0].equals("brokers") && parts[1].equals("ids")) {
             int id = Integer.parseInt(parts[2]);
             JsonObject json = GSON.fromJson(data, JsonObject.class);
+            // Heartbeat before registering: the leader's liveness clock starts when the
+            // registration commits, but submit() returns only once this node has applied it, which
+            // can take seconds when a restarted node is catching up on a divergent log.
+            quorum.heartbeatAs(id);
             quorum.submit(MetadataCommand.registerBroker(id, json.get("host").getAsString(), json.get("port").getAsInt(), incarnation));
             registeredBrokerId = id;
-            quorum.heartbeatAs(id);
             return true;
         }
         throw new UnsupportedOperationException("No metadata mapping for ephemeral node " + path);

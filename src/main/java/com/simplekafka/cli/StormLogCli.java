@@ -21,6 +21,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   consume TOPIC PARTITION [FROM_OFFSET]  print what's there and exit
  *   consume-group GROUP TOPIC SECONDS      join a consumer group and print what it receives
  *   commit GROUP TOPIC PARTITION OFFSET
+ *   consume-with-dlq TOPIC PARTITION SECONDS  handler rejects records containing "POISON";
+ *                                         they're dead-lettered to TOPIC.dlq, then the DLQ is printed
  *   forget-entity ENTITY_ID
  * </pre>
  */
@@ -47,6 +49,7 @@ public class StormLogCli {
                     System.out.println(args[3] + "-" + args[4] + "@" + offset);
                 }
                 case "produce-batch" -> {
+                    client.setLeaderRetryDeadlineMs(2_000); // report an offline partition rather than wait it out
                     int partitions = client.getNumPartitions(args[3]);
                     int count = Integer.parseInt(args[4]);
                     int failed = 0;
@@ -83,6 +86,8 @@ public class StormLogCli {
                     client.commitOffset(args[3], args[4], Integer.parseInt(args[5]), Long.parseLong(args[6]), "cli");
                     System.out.println("Committed " + args[3] + " " + args[4] + "-" + args[5] + " -> " + args[6]);
                 }
+                case "consume-with-dlq" -> consumeWithDlq(client, args[3], Integer.parseInt(args[4]),
+                        Long.parseLong(args[5]));
                 case "forget-entity" -> {
                     client.forgetEntity(args[3]);
                     System.out.println("Forgot entity " + args[3]);
@@ -94,6 +99,35 @@ public class StormLogCli {
             }
         }
         System.exit(0);
+    }
+
+    private static void consumeWithDlq(SimpleKafkaClient client, String topic, int partition, long seconds)
+            throws Exception {
+        AtomicInteger processed = new AtomicInteger();
+        com.simplekafka.client.DeadLetterRouter router = new com.simplekafka.client.DeadLetterRouter(
+                new com.simplekafka.client.RetryPolicy(2, 50, 2.0, 200),
+                (dlqTopic, envelope) -> client.send(dlqTopic, 0, envelope));
+        com.simplekafka.client.SimpleKafkaConsumer consumer =
+                new com.simplekafka.client.SimpleKafkaConsumer(client, topic, partition, null);
+        consumer.startConsuming((msg, offset) -> {
+            String text = new String(msg, StandardCharsets.UTF_8);
+            if (text.contains("POISON")) {
+                throw new IllegalArgumentException("Unparseable order at offset " + offset + ": " + text);
+            }
+            processed.incrementAndGet();
+        }, router);
+        Thread.sleep(seconds * 1000);
+        consumer.stopConsuming();
+        System.out.println("Processed " + processed.get() + " records; consumer position " + consumer.getCommittedOffset()
+                + " (not stuck behind the poison pill)");
+        String dlq = topic + ".dlq";
+        client.refreshMetadata();
+        for (SimpleKafkaClient.FetchedRecord r : client.fetchRecords(dlq, 0, 0, 1 << 20)) {
+            com.simplekafka.client.DeadLetterEnvelope e = com.simplekafka.client.DeadLetterEnvelope.deserialize(r.payload());
+            System.out.println(dlq + "@" + r.offset() + "  from " + e.getOriginalTopic() + "-" + e.getOriginalPartition()
+                    + "@" + e.getOriginalOffset() + "  " + e.getExceptionClassName() + ": " + e.getDeathReason()
+                    + "  payload=\"" + new String(e.getOriginalPayload(), StandardCharsets.UTF_8) + "\"");
+        }
     }
 
     private static void describe(SimpleKafkaClient client) throws Exception {

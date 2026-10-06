@@ -16,7 +16,7 @@ QUORUM="1@$HOST:${RAFT_PORTS[0]},2@$HOST:${RAFT_PORTS[1]},3@$HOST:${RAFT_PORTS[2
 PIDS=()
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
-cli() { java -cp "$JAR" com.simplekafka.cli.StormLogCli --bootstrap "$HOST:$1" "${@:2}" 2>/dev/null; }
+cli() { java -cp "$JAR" com.simplekafka.cli.StormLogCli --bootstrap "$HOST:$1" "${@:2}" 2>>"$DEMO_DIR/cli-errors.log"; }
 admin() { curl -s "http://$HOST:$(( $1 + 1000 ))$2"; }
 
 start_broker() {
@@ -26,7 +26,15 @@ start_broker() {
   PIDS[$idx]=$!
 }
 
-cleanup() { for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; done; }
+cleanup() {
+  local rc=$?
+  if [ $rc -ne 0 ]; then # thread dumps for diagnosis before anything is killed
+    for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && jstack "$pid" > "$DEMO_DIR/jstack-$pid.txt" 2>/dev/null || true; done
+  fi
+  for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; done
+  for pid in "${PIDS[@]:-}"; do [ -n "$pid" ] && wait "$pid" 2>/dev/null || true; done # free ports for the next run
+  if [ $rc -ne 0 ]; then echo "Demo failed (exit $rc); see $DEMO_DIR/cli-errors.log and $DEMO_DIR/broker-*.log" >&2; fi
+}
 trap cleanup EXIT
 
 wait_for() { # wait_for DESCRIPTION SECONDS COMMAND...
@@ -43,6 +51,7 @@ rm -rf "$DEMO_DIR" && mkdir -p "$DEMO_DIR"
 step "Starting 3 brokers (Raft quorum $QUORUM)"
 for id in 1 2 3; do start_broker "$id"; done
 wait_for "metadata leader" 60 quorum_has_leader "${BROKER_PORTS[0]}"
+wait_for "all 3 brokers registered" 60 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:${BROKER_PORTS[0]} describe 2>/dev/null | grep -o 'id=[123],' | sort -u | wc -l | grep -q 3"
 admin "${BROKER_PORTS[0]}" /admin/quorum; echo
 
 step "Creating topic 'orders' with 3 partitions (one per broker)"
@@ -54,6 +63,12 @@ cli "${BROKER_PORTS[0]}" consume orders 0 | head -3; echo "  ..."
 
 step "Consumer group 'billing' reads everything and commits"
 cli "${BROKER_PORTS[0]}" consume-group billing orders 3 | tail -1
+
+step "Poison pill: one unparseable record is dead-lettered; consumption continues past it"
+P0_LEADER_PORT=${BROKER_PORTS[0]}
+cli "$P0_LEADER_PORT" produce orders 0 "POISON {not json" >/dev/null
+cli "$P0_LEADER_PORT" produce orders 0 "message-after-poison" >/dev/null
+cli "$P0_LEADER_PORT" consume-with-dlq orders 0 3
 
 CONTROLLER=$(controller_id "${BROKER_PORTS[0]}")
 SURVIVOR_PORT=${BROKER_PORTS[0]}; [ "$CONTROLLER" = "1" ] && SURVIVOR_PORT=${BROKER_PORTS[1]}
@@ -70,7 +85,8 @@ cli "$SURVIVOR_PORT" produce-batch orders 9 || true
 
 step "Restarting broker $CONTROLLER: it re-registers and is re-elected leader of its partition"
 start_broker "$CONTROLLER"
-sleep 8
+# A restarted ex-leader may first have to catch up on a divergent log; wait for its partition
+wait_for "broker $CONTROLLER back online" 60 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep -q 'orders:.*' && ! java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep 'orders:' | grep -q OFFLINE"
 cli "$SURVIVOR_PORT" describe
 for p in 0 1 2; do
   echo "  orders-$p: $(cli "$SURVIVOR_PORT" consume orders $p | wc -l | tr -d ' ') messages"

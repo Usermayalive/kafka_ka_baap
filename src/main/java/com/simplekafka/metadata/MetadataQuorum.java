@@ -211,9 +211,14 @@ public class MetadataQuorum implements AutoCloseable {
             return;
         }
         try {
-            client.io().sendReadOnly(Message.valueOf("HEARTBEAT " + id));
-        } catch (IOException | RuntimeException e) {
-            LOGGER.log(Level.FINE, "Heartbeat to metadata leader failed", e);
+            // Bounded: a blocking send can spend seconds retrying (e.g. right after a restart),
+            // which would starve every later heartbeat on this timer thread
+            client.async().sendReadOnly(Message.valueOf("HEARTBEAT " + id))
+                    .get(HEARTBEAT_INTERVAL_MS * 2, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            LOGGER.log(Level.FINE, "Heartbeat to metadata leader failed; retrying next interval", e);
         }
     }
 
