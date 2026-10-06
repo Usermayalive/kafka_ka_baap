@@ -43,6 +43,8 @@ public class KafkaFrame {
     public static final short ERROR_NOT_COORDINATOR = 1009;
     public static final short ERROR_COORDINATOR_NOT_AVAILABLE = 1010;
     public static final short ERROR_UNKNOWN_MEMBER = 1011;
+    public static final short ERROR_NOT_LEADER = 1012;
+    public static final short ERROR_LEADER_NOT_AVAILABLE = 1013;
 
     /** Produce with this producer ID to bypass idempotence (Kafka's NO_PRODUCER_ID). */
     public static final long NO_PRODUCER_ID = -1L;

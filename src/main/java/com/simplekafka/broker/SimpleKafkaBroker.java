@@ -4,6 +4,8 @@ package com.simplekafka.broker;
 import com.google.gson.Gson;
 import com.simplekafka.coordinator.ConsumerOffsetStore;
 import com.simplekafka.coordinator.GroupCoordinator;
+import com.simplekafka.metadata.MetadataLog;
+import com.simplekafka.metadata.MetadataQuorum;
 import com.simplekafka.network.ClientQuotaManager;
 import com.simplekafka.observability.AdminHttpServer;
 import com.simplekafka.observability.AuditLog;
@@ -45,7 +47,10 @@ public class SimpleKafkaBroker {
     private final AtomicBoolean isRunning;
     private final AtomicBoolean isController;
     private final Map<Integer, BrokerInfo> clusterMetadata;
-    private final ZookeeperClient zkClient;
+    private volatile MetadataLog zkClient; // ZooKeeper-compatible API over the Raft metadata quorum
+    private final int raftPort;
+    private volatile List<MetadataQuorum.Peer> quorumVoters;
+    private volatile boolean joinQuorumAsLearner;
     private final Gson gson;
     private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> topicCreationGuards = new ConcurrentHashMap<>();
     private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
@@ -58,7 +63,11 @@ public class SimpleKafkaBroker {
     private volatile AdminHttpServer adminServer;
     private volatile int adminPort = -1;
 
-    public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
+    /**
+     * @param raftPort port of this broker's metadata quorum member. Standalone by default; call
+     *                 {@link #setMetadataQuorum} before start() to join a multi-node quorum.
+     */
+    public SimpleKafkaBroker(int brokerId, String host, int port, int raftPort) throws IOException {
         this.brokerId = brokerId;
         this.brokerHost = host;
         this.brokerPort = port;
@@ -80,7 +89,7 @@ public class SimpleKafkaBroker {
         }
         
         // Initialize ZooKeeper client
-        this.zkClient = new ZookeeperClient("localhost:" + zkPort);
+        this.raftPort = raftPort;
     }
 
     public void start() throws Exception {
@@ -89,14 +98,20 @@ public class SimpleKafkaBroker {
 
         nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, new ClientQuotaManager(),
                 new IdempotenceManager(),
-                new ProducerIdManager((short) brokerId, new File(DATA_DIR + File.separator + brokerId, "producer_id_epoch")),
+                new ProducerIdManager((short) brokerId, new File(dataDir(), "producer_id_epoch")),
                 NettyBrokerServer.DEFAULT_REQUEST_QUEUE_CAPACITY);
         nettyServer.start();
         int resolvedAdminPort = adminPort >= 0 ? adminPort : (brokerPort == 0 ? 0 : brokerPort + 1000);
         adminServer = new AdminHttpServer(brokerHost, resolvedAdminPort, metrics, this::partitionLag);
         LOGGER.info("Admin HTTP (/metrics, /admin/lag) on " + brokerHost + ":" + adminServer.port());
 
+        List<MetadataQuorum.Peer> voters = quorumVoters != null ? quorumVoters
+                : List.of(new MetadataQuorum.Peer(brokerId, brokerHost, raftPort));
+        MetadataQuorum.Peer self = new MetadataQuorum.Peer(brokerId, brokerHost, raftPort);
+        zkClient = new MetadataLog(new MetadataQuorum(self, voters, joinQuorumAsLearner,
+                new File(dataDir(), "__metadata"), MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS));
         zkClient.connect();
+        zkClient.onPartitionStateChange(this::reloadAllTopics);
         registerWithZookeeper();
         electController();
         loadExistingTopics();
@@ -114,7 +129,9 @@ public class SimpleKafkaBroker {
                 adminServer.close();
             }
             groupCoordinator.close();
-            zkClient.close();
+            if (zkClient != null) {
+                zkClient.close();
+            }
             LOGGER.info("Broker " + brokerId + " stopped");
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error stopping broker", e);
@@ -125,7 +142,7 @@ public class SimpleKafkaBroker {
         try {
             JsonObject brokerData = new JsonObject();
             brokerData.addProperty("host", brokerHost);
-            brokerData.addProperty("port", brokerPort);
+            brokerData.addProperty("port", getPort()); // bound port (brokerPort may be 0)
             brokerData.add("endpoints", new JsonArray());
             
             String path = "/brokers/ids/" + brokerId;
@@ -178,45 +195,18 @@ public class SimpleKafkaBroker {
     private void electController() {
         try {
             String controllerPath = "/controller";
-            
-            boolean nodeExists = false;
-            try {
-                String existingData = zkClient.getData(controllerPath);
-                if (existingData == null || existingData.trim().isEmpty()) {
-                    nodeExists = false; 
-                } else {
-                    nodeExists = true;
-                }
-            } catch (Exception e) {
-                nodeExists = false;
-            }
-            
-            boolean becameController = false;
-            if (!nodeExists) {
-                JsonObject data = new JsonObject();
-                data.addProperty("broker", brokerId);
-                data.addProperty("timestamp", System.currentTimeMillis());
-                becameController = zkClient.createEphemeralNode(controllerPath, gson.toJson(data));
-            }
-            
-            if (becameController) {
+            JsonObject data = new JsonObject();
+            data.addProperty("broker", brokerId);
+            // Raft: "creating" the controller node succeeds exactly on the metadata leader
+            boolean becameController = zkClient.createEphemeralNode(controllerPath, gson.toJson(data));
+            boolean wasController = isController.getAndSet(becameController);
+            if (becameController && !wasController) {
                 LOGGER.info("Broker " + brokerId + " became controller");
-                isController.set(true);
                 rebalancePartitions();
-            } else {
-                isController.set(false);
-                zkClient.watchNode(controllerPath, this::onControllerChange);
             }
+            zkClient.watchNode(controllerPath, this::onControllerChange);
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Controller election failed", e);
-            new Thread(() -> {
-                try {
-                    Thread.sleep(2000);
-                    electController();
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
-            }).start();
         }
     }
 
@@ -341,7 +331,15 @@ public class SimpleKafkaBroker {
                     state.getAsJsonArray("replicas").forEach(e -> replicas.add(e.getAsInt()));
 
                     if (leader == brokerId || replicas.contains(brokerId)) {
-                        String baseDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
+                        Partition existing = hostedPartition(topic, i);
+                        if (existing != null) {
+                            existing.setLeader(leader);
+                            List<Integer> followers = new ArrayList<>(replicas);
+                            followers.remove((Integer) leader);
+                            existing.setFollowers(followers);
+                            continue;
+                        }
+                        String baseDir = dataDir() + File.separator + topic;
                         boolean compacted = config.has("cleanup.policy")
                                 && "compact".equalsIgnoreCase(config.get("cleanup.policy").getAsString());
                         // Compacted topics stay local: compaction rewrites whole partitions (Kafka has the same limit)
@@ -352,10 +350,8 @@ public class SimpleKafkaBroker {
                         followers.remove((Integer) leader);
                         partition.setFollowers(followers);
                         
-                        if (partList.size() <= i) {
-                            partList.add(partition);
-                        } else {
-                            partList.set(i, partition);
+                        synchronized (partList) {
+                            partList.add(partition); // looked up by id via hostedPartition(), not index
                         }
                     }
                 }
@@ -391,10 +387,70 @@ public class SimpleKafkaBroker {
         return topics;
     }
 
-    private void rebalancePartitions() {
-        if (!isController.get()) return;
-        LOGGER.info("Rebalancing partitions...");
-        // Rebalancing logic to be implemented
+    /** Re-reads every topic's partition states (leadership changes) without reopening partitions. */
+    private void reloadAllTopics() {
+        try {
+            for (String topic : zkClient.getChildren("/topics")) {
+                loadTopic(topic);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to reload topic metadata", e);
+        }
+        if (isController.get()) {
+            rebalancePartitions();
+        }
+    }
+
+    /**
+     * Controller: keep partition leadership on live brokers. A partition whose leader is gone
+     * fails over to a live in-sync replica; with no replication that set is just the old leader,
+     * so the partition goes offline (leader -1) until its broker returns, and is then re-elected.
+     * Electing an out-of-sync replica would silently lose the partition's data.
+     */
+    private synchronized void rebalancePartitions() {
+        if (!isController.get() || zkClient == null) {
+            return;
+        }
+        Set<Integer> alive = zkClient.image().brokers().keySet();
+        for (var topic : zkClient.image().topics().values()) {
+            for (int i = 0; i < topic.partitions().size(); i++) {
+                var state = topic.partitions().get(i);
+                int desired = state.isr().stream().filter(alive::contains).findFirst().orElse(-1);
+                boolean leaderAlive = state.leader() >= 0 && alive.contains(state.leader());
+                if (!leaderAlive && desired != state.leader()) {
+                    try {
+                        zkClient.electLeader(topic.name(), i, desired);
+                        LOGGER.info("Partition " + topic.name() + "-" + i + " leader " + state.leader() + " -> " + desired
+                                + (desired < 0 ? " (offline: no live in-sync replica)" : ""));
+                    } catch (Exception e) {
+                        LOGGER.log(Level.WARNING, "Leader election for " + topic.name() + "-" + i + " failed", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Voters of the metadata quorum, e.g. parsed from "1@host:9091,2@host:9092,3@host:9093". */
+    public void setMetadataQuorum(List<MetadataQuorum.Peer> voters, boolean joinAsLearner) {
+        this.quorumVoters = voters;
+        this.joinQuorumAsLearner = joinAsLearner;
+    }
+
+    public MetadataLog getMetadataLog() {
+        return zkClient;
+    }
+
+    /** Simulates a crash: stops serving without unregistering, so the leader must detect it by missed heartbeats. */
+    void crashForTest() throws IOException {
+        isRunning.set(false);
+        if (nettyServer != null) {
+            nettyServer.stop();
+        }
+        if (adminServer != null) {
+            adminServer.close();
+        }
+        groupCoordinator.close();
+        zkClient.quorum().close();
     }
 
     /** Brokers currently registered in cluster metadata; just this broker when running standalone. */
@@ -616,16 +672,21 @@ public class SimpleKafkaBroker {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: SimpleKafkaBroker <brokerId> <host> <port> <zkPort> [OS_PAGE_CACHE|PHYSICAL_FSYNC]");
+            System.err.println("Usage: SimpleKafkaBroker <brokerId> <host> <port> <raftPort> [OS_PAGE_CACHE|PHYSICAL_FSYNC]");
             System.exit(1);
         }
         
         int brokerId = Integer.parseInt(args[0]);
         String host = args[1];
         int port = Integer.parseInt(args[2]);
-        int zkPort = Integer.parseInt(args[3]);
+        int raftPort = Integer.parseInt(args[3]);
         
-        SimpleKafkaBroker broker = new SimpleKafkaBroker(brokerId, host, port, zkPort);
+        SimpleKafkaBroker broker = new SimpleKafkaBroker(brokerId, host, port, raftPort);
+        String quorum = System.getenv("STORMLOG_QUORUM"); // "1@host:raftPort,2@host:raftPort,..."
+        if (quorum != null && !quorum.isBlank()) {
+            broker.setMetadataQuorum(MetadataQuorum.Peer.parseList(quorum),
+                    Boolean.parseBoolean(System.getenv().getOrDefault("STORMLOG_JOIN_AS_LEARNER", "false")));
+        }
         if (args.length >= 5) {
             broker.setDurabilityMode(DurabilityMode.valueOf(args[4]));
         }

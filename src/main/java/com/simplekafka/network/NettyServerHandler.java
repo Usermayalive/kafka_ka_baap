@@ -188,20 +188,14 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         }
 
         // 2. Resolve Partition
-        List<Partition> parts = broker.getTopics().get(topic);
-        if (parts == null || partitionId >= parts.size()) {
-            // Check companion DLQ auto-creation
-            if (topic.endsWith(".dlq")) {
-                broker.createTopic(topic, 1, (short) 1);
-                parts = broker.getTopics().get(topic);
-            }
-            if (parts == null || partitionId >= parts.size()) {
-                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
-                        KafkaFrame.ERROR_UNKNOWN_TOPIC_OR_PARTITION, "Topic or partition not found: " + topic + "-" + partitionId);
-            }
+        if (broker.hostedPartition(topic, partitionId) == null && topic.endsWith(".dlq")) {
+            broker.createTopic(topic, 1, (short) 1); // companion DLQ auto-creation
         }
-
-        Partition partition = parts.get(partitionId);
+        Partition partition = broker.hostedPartition(topic, partitionId);
+        KafkaFrame notLeader = rejectIfNotLeader(frame, topic, partitionId, partition);
+        if (notLeader != null) {
+            return notLeader;
+        }
         broker.getMetrics().recordProduce(topic, message.length);
         if (producerId == KafkaFrame.NO_PRODUCER_ID) {
             return produceResponse(frame, topic, partitionId, partition.append(message), false);
@@ -242,13 +236,11 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         long fetchOffset = dis.readLong();
         int maxBytes = dis.readInt();
 
-        List<Partition> parts = broker.getTopics().get(topic);
-        if (parts == null || partitionId >= parts.size()) {
-            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
-                    KafkaFrame.ERROR_UNKNOWN_TOPIC_OR_PARTITION, "Topic/partition not found: " + topic);
+        Partition partition = broker.hostedPartition(topic, partitionId);
+        KafkaFrame notLeader = rejectIfNotLeader(frame, topic, partitionId, partition);
+        if (notLeader != null) {
+            return notLeader;
         }
-
-        Partition partition = parts.get(partitionId);
         List<Partition.Record> records = partition.readRecords(fetchOffset, maxBytes);
 
         // [error][count]{[offset:8][len:4][payload]}[logEndOffset:8]
@@ -450,6 +442,30 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             result.add(new com.simplekafka.coordinator.GroupCoordinator.TopicPartition(dis.readUTF(), dis.readInt()));
         }
         return result;
+    }
+
+    /**
+     * Produce and fetch are served only by the partition's leader. Clients refresh metadata and
+     * retry on NOT_LEADER / LEADER_NOT_AVAILABLE. A leader of 0 means "unassigned" (standalone
+     * brokers without cluster metadata) and is served locally.
+     */
+    private KafkaFrame rejectIfNotLeader(KafkaFrame frame, String topic, int partitionId, Partition partition) {
+        if (partition == null) {
+            boolean known = broker.partitionCount(topic) > partitionId;
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
+                    known ? KafkaFrame.ERROR_NOT_LEADER : KafkaFrame.ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                    (known ? "Not the leader for " : "Topic or partition not found: ") + topic + "-" + partitionId);
+        }
+        if (partition.getLeader() < 0) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_LEADER_NOT_AVAILABLE,
+                    topic + "-" + partitionId + " is offline: its only in-sync replica is down");
+        }
+        if (partition.getLeader() > 0 && partition.getLeader() != broker.getBrokerId()) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_LEADER,
+                    "Broker " + broker.getBrokerId() + " is not the leader for " + topic + "-" + partitionId
+                            + " (leader: " + partition.getLeader() + ")");
+        }
+        return null;
     }
 
     private KafkaFrame rejectIfNotCoordinator(KafkaFrame frame, String group) {

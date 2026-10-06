@@ -114,7 +114,7 @@ public class SimpleKafkaClient implements AutoCloseable {
 
     /** Non-idempotent produce; see NettyIdempotentProducer for exactly-once-per-session semantics. */
     public long send(String topic, int partition, byte[] message) throws IOException {
-        DataInputStream in = leaderConnection(topic, partition).request(KafkaFrame.API_KEY_PRODUCE, payload(o -> {
+        byte[] request = payload(o -> {
             o.writeUTF(clientId);
             o.writeUTF(topic);
             o.writeInt(partition);
@@ -123,14 +123,15 @@ public class SimpleKafkaClient implements AutoCloseable {
             o.writeInt(0);
             o.writeInt(message.length);
             o.write(message);
-        }));
+        });
+        DataInputStream in = leaderRequest(topic, partition, KafkaFrame.API_KEY_PRODUCE, request);
         in.readUTF();
         in.readInt();
         return in.readLong();
     }
 
     public List<FetchedRecord> fetchRecords(String topic, int partition, long offset, int maxBytes) throws IOException {
-        DataInputStream in = leaderConnection(topic, partition).request(KafkaFrame.API_KEY_FETCH, payload(o -> {
+        DataInputStream in = leaderRequest(topic, partition, KafkaFrame.API_KEY_FETCH, payload(o -> {
             o.writeUTF(clientId);
             o.writeUTF(topic);
             o.writeInt(partition);
@@ -229,6 +230,35 @@ public class SimpleKafkaClient implements AutoCloseable {
             }
         }
         return layout;
+    }
+
+    private static final int LEADER_RETRIES = 10;
+    private static final long LEADER_RETRY_BACKOFF_MS = 200;
+
+    /** Sends to the partition leader; on a leadership error refreshes metadata and retries. */
+    private DataInputStream leaderRequest(String topic, int partition, short apiKey, byte[] request) throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return leaderConnection(topic, partition).request(apiKey, request);
+            } catch (BrokerErrorException e) {
+                boolean leadershipMoved = e.getErrorCode() == KafkaFrame.ERROR_NOT_LEADER
+                        || e.getErrorCode() == KafkaFrame.ERROR_LEADER_NOT_AVAILABLE;
+                if (!leadershipMoved || attempt >= LEADER_RETRIES) {
+                    throw e;
+                }
+            } catch (IOException e) {
+                if (attempt >= LEADER_RETRIES) {
+                    throw e; // leader unreachable; metadata may name a new one shortly
+                }
+            }
+            try {
+                Thread.sleep(LEADER_RETRY_BACKOFF_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for partition leadership", ie);
+            }
+            refreshMetadata();
+        }
     }
 
     private BrokerConnection leaderConnection(String topic, int partition) throws IOException {
