@@ -44,6 +44,12 @@ services:
     ports: ["19094:9092", "20094:10092"]
     volumes: ["broker3-data:/data"]
 
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]   # http://localhost:9090  e.g. query: stormlog_group_lag_records
+
   cli:
     build: .
     profiles: ["tools"]

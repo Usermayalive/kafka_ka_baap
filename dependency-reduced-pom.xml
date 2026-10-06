@@ -5,6 +5,7 @@
   <artifactId>simple-kafka</artifactId>
   <version>1.0-SNAPSHOT</version>
   <build>
+    <directory>${build.dir}</directory>
     <plugins>
       <plugin>
         <artifactId>maven-compiler-plugin</artifactId>
@@ -19,6 +20,9 @@
         <version>3.2.5</version>
         <configuration>
           <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <stormlog.data.dir>${project.build.directory}/test-kafka-data</stormlog.data.dir>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
       <plugin>
@@ -31,6 +35,16 @@
               <goal>shade</goal>
             </goals>
             <configuration>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
               <transformers>
                 <transformer>
                   <mainClass>com.simplekafka.broker.SimpleKafkaBroker</mainClass>
@@ -68,10 +82,31 @@
       </exclusions>
     </dependency>
   </dependencies>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-bom</artifactId>
+        <version>${netty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${awssdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
   <properties>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <build.dir>${project.basedir}/target</build.dir>
     <maven.compiler.target>25</maven.compiler.target>
-    <junit.version>5.10.2</junit.version>
+    <netty.version>4.1.138.Final</netty.version>
     <maven.compiler.source>25</maven.compiler.source>
+    <awssdk.version>2.55.11</awssdk.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <junit.version>5.10.2</junit.version>
   </properties>
 </project>
