@@ -49,7 +49,16 @@ public class ClientQuotaManager {
         }
     }
 
+    /** No-op limiter: quotas disabled. */
+    public static ClientQuotaManager unlimited() {
+        return new ClientQuotaManager(0, 0);
+    }
+
     public void checkAndConsume(String clientId, int bytesRequested) throws QuotaExceededException {
+        if (maxBytesPerSecond <= 0 && maxRequestsPerSecond <= 0) {
+            return; // quotas disabled
+        }
+        // A limit <= 0 is disabled individually (its bucket never refills, so it is skipped below)
         long nowNanos = System.nanoTime();
         ClientBucket bucket = buckets.computeIfAbsent(clientId,
                 k -> new ClientBucket(maxBytesPerSecond, maxRequestsPerSecond, nowNanos));
@@ -63,14 +72,14 @@ public class ClientQuotaManager {
                 bucket.lastRefillNanos = nowNanos;
             }
 
-            if (bucket.requestTokens < 1.0) {
+            if (maxRequestsPerSecond > 0 && bucket.requestTokens < 1.0) {
                 long throttleMs = (long) Math.ceil((1.0 - bucket.requestTokens) / maxRequestsPerSecond * 1000);
                 throw new QuotaExceededException(clientId, throttleMs,
                         String.format("Client [%s] exceeded request rate quota (%d req/s). Throttle: %d ms",
                                 clientId, maxRequestsPerSecond, throttleMs));
             }
 
-            if (bucket.byteTokens < bytesRequested) {
+            if (maxBytesPerSecond > 0 && bucket.byteTokens < bytesRequested) {
                 long throttleMs = (long) Math.ceil((bytesRequested - bucket.byteTokens) / maxBytesPerSecond * 1000);
                 throw new QuotaExceededException(clientId, throttleMs,
                         String.format("Client [%s] exceeded byte rate quota (%d B/s). Requested: %d B, Throttle: %d ms",

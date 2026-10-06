@@ -70,6 +70,7 @@ public class SimpleKafkaBroker {
     private volatile AuditLog auditLog;
     private volatile AdminHttpServer adminServer;
     private volatile int adminPort = -1;
+    private volatile ClientQuotaManager quotaManager = new ClientQuotaManager();
     // Used when running without a metadata quorum (standalone/tests); the quorum's image otherwise
     private final MetadataImage localImage = new MetadataImage();
     private final SchemaService schemaService = new SchemaService(this::metadataImage);
@@ -107,7 +108,7 @@ public class SimpleKafkaBroker {
         isRunning.set(true);
         LOGGER.info("Starting broker " + brokerId + " on " + brokerHost + ":" + brokerPort);
 
-        nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, new ClientQuotaManager(),
+        nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, quotaManager,
                 new IdempotenceManager(),
                 new ProducerIdManager((short) brokerId, new File(dataDir(), "producer_id_epoch")),
                 NettyBrokerServer.DEFAULT_REQUEST_QUEUE_CAPACITY);
@@ -804,6 +805,11 @@ public class SimpleKafkaBroker {
         return durabilityMode;
     }
 
+    /** Per-client byte/request rate limits; set before start(). */
+    public void setQuotaManager(ClientQuotaManager quotaManager) {
+        this.quotaManager = quotaManager;
+    }
+
     /** Remote tier for sealed segments of non-compacted topics opened from now on; null disables. */
     public void setTieredStorage(TieredStorageConfig tieredStorage) {
         this.tieredStorage = tieredStorage;
@@ -837,6 +843,12 @@ public class SimpleKafkaBroker {
         } else if (System.getenv(EnvMasterKeyProvider.ENV_VAR) != null) {
             broker.enableCryptoShredding(EnvMasterKeyProvider.fromEnvironment());
         }
+        // Per-client quotas (0 disables a limit). Defaults: 50 MB/s, 5,000 requests/s per client ID.
+        long quotaBytes = Long.parseLong(System.getenv().getOrDefault("STORMLOG_QUOTA_BYTES_PER_SEC",
+                String.valueOf(ClientQuotaManager.DEFAULT_MAX_BYTES_PER_SEC)));
+        long quotaRequests = Long.parseLong(System.getenv().getOrDefault("STORMLOG_QUOTA_REQUESTS_PER_SEC",
+                String.valueOf(ClientQuotaManager.DEFAULT_MAX_REQUESTS_PER_SEC)));
+        broker.setQuotaManager(new ClientQuotaManager(quotaBytes, quotaRequests));
         String s3Endpoint = System.getenv("STORMLOG_S3_ENDPOINT");
         if (s3Endpoint != null && !s3Endpoint.isBlank()) {
             S3RemoteStorageManager s3 = S3RemoteStorageManager.create(s3Endpoint,
