@@ -176,6 +176,7 @@ Each was found by measuring or by a test written to break the feature, and each 
 | Legacy fetch numbered records sequentially | Consumers mis-positioned after compaction |
 | Shutdown of the last quorum member retried forever | Broker shutdown hung for minutes |
 | Erasure missed by a broker catching up from a Raft snapshot; raw entity IDs in the Raft log | A "forgotten" person's data still readable; their identifier persisted forever |
+| Restart races: heartbeats started after the registration had been applied, registration gave up after one timeout, watch callbacks blocked metadata notifications | A restarted broker could be fenced again, or stay unregistered or with a stale view of the cluster forever |
 | An IDE compiling into `target/` emitted class files for code that didn't compile | Maven reported success on broken code (hence `-Dbuild.dir`) |
 
 ## Documentation
