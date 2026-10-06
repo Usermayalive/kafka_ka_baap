@@ -112,6 +112,12 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                 return handleMetadata(frame);
             case KafkaFrame.API_KEY_CREATE_TOPIC:
                 return handleCreateTopic(frame);
+            case KafkaFrame.API_KEY_FIND_COORDINATOR:
+                return handleFindCoordinator(frame);
+            case KafkaFrame.API_KEY_OFFSET_COMMIT:
+                return handleOffsetCommit(frame);
+            case KafkaFrame.API_KEY_OFFSET_FETCH:
+                return handleOffsetFetch(frame);
             default:
                 return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                         KafkaFrame.ERROR_CORRUPT_MESSAGE, "Unknown apiKey: " + frame.getApiKey());
@@ -296,6 +302,81 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         new DataOutputStream(baos).writeShort(KafkaFrame.ERROR_NONE);
         return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
+    }
+
+    /** Request: [clientId][group]. Response: [error][brokerId:4][host][port:4]. */
+    private KafkaFrame handleFindCoordinator(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String group = dis.readUTF();
+        com.simplekafka.broker.BrokerInfo coordinator = broker.coordinatorFor(group);
+        if (coordinator == null) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
+                    KafkaFrame.ERROR_COORDINATOR_NOT_AVAILABLE, "No coordinator available for group " + group);
+        }
+        return okFrame(frame, out -> {
+            out.writeInt(coordinator.getId());
+            out.writeUTF(coordinator.getHost());
+            out.writeInt(coordinator.getPort());
+        });
+    }
+
+    /** Request: [clientId][group][topic][partition:4][offset:8][metadata]. Response: [error]. */
+    private KafkaFrame handleOffsetCommit(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String group = dis.readUTF();
+        String topic = dis.readUTF();
+        int partition = dis.readInt();
+        long offset = dis.readLong();
+        String metadata = dis.readUTF();
+        KafkaFrame notCoordinator = rejectIfNotCoordinator(frame, group);
+        if (notCoordinator != null) {
+            return notCoordinator;
+        }
+        broker.getOffsetStore().commit(group, topic, partition, offset, metadata);
+        return okFrame(frame, out -> {});
+    }
+
+    /** Request: [clientId][group][topic][partition:4]. Response: [error][offset:8] (-1 if none)[metadata]. */
+    private KafkaFrame handleOffsetFetch(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String group = dis.readUTF();
+        String topic = dis.readUTF();
+        int partition = dis.readInt();
+        KafkaFrame notCoordinator = rejectIfNotCoordinator(frame, group);
+        if (notCoordinator != null) {
+            return notCoordinator;
+        }
+        var committed = broker.getOffsetStore().fetch(group, topic, partition);
+        return okFrame(frame, out -> {
+            out.writeLong(committed == null ? -1L : committed.offset());
+            out.writeUTF(committed == null ? "" : committed.metadata());
+        });
+    }
+
+    private KafkaFrame rejectIfNotCoordinator(KafkaFrame frame, String group) {
+        int offsetsPartition = com.simplekafka.coordinator.ConsumerOffsetStore.partitionFor(group);
+        if (broker.hostedPartition(com.simplekafka.coordinator.ConsumerOffsetStore.TOPIC, offsetsPartition) == null) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_COORDINATOR,
+                    "Broker " + broker.getBrokerId() + " is not the coordinator for group " + group);
+        }
+        return null;
+    }
+
+    @FunctionalInterface
+    interface BodyWriter {
+        void write(DataOutputStream out) throws IOException;
+    }
+
+    private KafkaFrame okFrame(KafkaFrame request, BodyWriter body) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(baos);
+        dos.writeShort(KafkaFrame.ERROR_NONE);
+        body.write(dos);
+        dos.flush();
+        return new KafkaFrame(request.getApiKey(), request.getApiVersion(), request.getCorrelationId(), baos.toByteArray());
     }
 
     private KafkaFrame buildErrorFrame(short apiKey, int correlationId, short errorCode, String errorMsg) {

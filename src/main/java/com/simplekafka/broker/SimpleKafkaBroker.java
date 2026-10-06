@@ -2,6 +2,7 @@ package com.simplekafka.broker;
 
 
 import com.google.gson.Gson;
+import com.simplekafka.coordinator.ConsumerOffsetStore;
 import com.simplekafka.network.ClientQuotaManager;
 import com.simplekafka.network.IdempotenceManager;
 import com.simplekafka.network.NettyBrokerServer;
@@ -45,6 +46,7 @@ public class SimpleKafkaBroker {
     private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> topicCreationGuards = new ConcurrentHashMap<>();
     private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
     private volatile TieredStorageConfig tieredStorage;
+    private final ConsumerOffsetStore offsetStore = new ConsumerOffsetStore(p -> hostedPartition(ConsumerOffsetStore.TOPIC, p));
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -236,7 +238,7 @@ public class SimpleKafkaBroker {
             JsonObject config = new JsonObject();
             config.addProperty("partitions", numPartitions);
             config.addProperty("replication_factor", replicationFactor);
-            if (topic.endsWith(".dlq")) {
+            if (topic.endsWith(".dlq") || topic.equals(ConsumerOffsetStore.TOPIC)) {
                 config.addProperty("cleanup.policy", "compact");
             }
             zkClient.createPersistentNode("/topics/" + topic, gson.toJson(config));
@@ -414,6 +416,55 @@ public class SimpleKafkaBroker {
             }
             return local;
         }
+    }
+
+    public ConsumerOffsetStore getOffsetStore() {
+        return offsetStore;
+    }
+
+    /** This broker's replica of topic-partition, or null if it does not host it. */
+    public Partition hostedPartition(String topic, int partitionId) {
+        List<Partition> parts = topics.get(topic);
+        if (parts == null) {
+            return null;
+        }
+        for (Partition p : parts) {
+            if (p.getId() == partitionId) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The broker coordinating a consumer group: the leader of its {@code __consumer_offsets}
+     * partition. The controller creates the topic on first use. Returns null while unavailable.
+     */
+    public BrokerInfo coordinatorFor(String group) {
+        int offsetsPartition = ConsumerOffsetStore.partitionFor(group);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            for (TopicDescription topic : describeTopics()) {
+                if (!topic.name().equals(ConsumerOffsetStore.TOPIC)) {
+                    continue;
+                }
+                for (PartitionDescription p : topic.partitions()) {
+                    if (p.partitionId() == offsetsPartition) {
+                        for (BrokerInfo b : liveBrokers()) {
+                            if (b.getId() == p.leader()) {
+                                return b;
+                            }
+                        }
+                        return null; // leader is down; no replication to fail over to
+                    }
+                }
+            }
+            if (attempt == 0 && isController()) {
+                createTopic(ConsumerOffsetStore.TOPIC, ConsumerOffsetStore.PARTITIONS, (short) 1);
+            } else {
+                break;
+            }
+        }
+        return null;
     }
 
     public boolean isController() {

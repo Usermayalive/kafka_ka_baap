@@ -12,6 +12,8 @@ public class SimpleKafkaConsumer {
     private static final long POLL_INTERVAL_MS = 100;
 
     private final SimpleKafkaClient client;
+    private final String groupId;
+    private long lastCommitted = -1;
     private final String topic;
     private final int partition;
     private long currentOffset;      // Fetch cursor for the next poll
@@ -25,6 +27,15 @@ public class SimpleKafkaConsumer {
     }
 
     SimpleKafkaConsumer(SimpleKafkaClient client, String topic, int partition) {
+        this(client, topic, partition, null);
+    }
+
+    /**
+     * @param groupId consumer group whose committed offset this consumer resumes from and
+     *                commits to after each processed batch; null for no offset storage
+     */
+    public SimpleKafkaConsumer(SimpleKafkaClient client, String topic, int partition, String groupId) {
+        this.groupId = groupId;
         this.client = client;
         this.topic = topic;
         this.partition = partition;
@@ -104,6 +115,7 @@ public class SimpleKafkaConsumer {
         if (running.compareAndSet(false, true)) {
             consumerThread = new Thread(() -> {
                 try {
+                    resumeFromCommitted();
                     while (running.get()) {
                         if (paused.get()) {
                             Thread.sleep(POLL_INTERVAL_MS);
@@ -132,6 +144,7 @@ public class SimpleKafkaConsumer {
                             }
                         }
 
+                        commitSync();
                         if (messages.isEmpty()) {
                             Thread.sleep(POLL_INTERVAL_MS);
                         }
@@ -160,6 +173,32 @@ public class SimpleKafkaConsumer {
                 }
             }
             LOGGER.info("Stopped consuming from topic: " + topic + ", partition: " + partition);
+        }
+    }
+
+    /** Positions the fetch cursor at the group's committed offset, if any. */
+    public void resumeFromCommitted() throws IOException {
+        if (groupId == null) {
+            return;
+        }
+        long committed = client.fetchCommittedOffset(groupId, topic, partition);
+        if (committed >= 0) {
+            seek(committed);
+            committedOffset = committed;
+            lastCommitted = committed;
+            LOGGER.info("Group " + groupId + " resuming " + topic + "-" + partition + " at offset " + committed);
+        }
+    }
+
+    /**
+     * Commits the next offset to process (Kafka convention: last processed + 1) if it advanced.
+     * Only offsets past fully handled or dead-lettered records are ever committed.
+     */
+    public void commitSync() throws IOException {
+        if (groupId != null && committedOffset > lastCommitted) {
+            long toCommit = committedOffset;
+            client.commitOffset(groupId, topic, partition, toCommit, "");
+            lastCommitted = toCommit;
         }
     }
 

@@ -23,6 +23,7 @@ public class SimpleKafkaClient implements AutoCloseable {
     private final Map<String, List<PartitionLayout>> topicLayouts = new ConcurrentHashMap<>();
     private final Map<Integer, BrokerInfo> clusterBrokers = new ConcurrentHashMap<>();
     private final Map<String, BrokerConnection> connections = new ConcurrentHashMap<>();
+    private final Map<String, BrokerInfo> coordinators = new ConcurrentHashMap<>();
 
     public record PartitionLayout(int partition, int leader, List<Integer> replicas) {}
 
@@ -153,6 +154,60 @@ public class SimpleKafkaClient implements AutoCloseable {
             payloads.add(r.payload());
         }
         return payloads;
+    }
+
+    /** Locates the broker coordinating {@code group} (cached until it stops answering). */
+    public BrokerInfo findCoordinator(String group) throws IOException {
+        BrokerInfo cached = coordinators.get(group);
+        if (cached != null) {
+            return cached;
+        }
+        DataInputStream in = connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_FIND_COORDINATOR,
+                payload(o -> {
+                    o.writeUTF(clientId);
+                    o.writeUTF(group);
+                }));
+        BrokerInfo coordinator = new BrokerInfo(in.readInt(), in.readUTF(), in.readInt());
+        coordinators.put(group, coordinator);
+        return coordinator;
+    }
+
+    public void commitOffset(String group, String topic, int partition, long offset, String metadata) throws IOException {
+        coordinatorRequest(group, KafkaFrame.API_KEY_OFFSET_COMMIT, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeUTF(group);
+            o.writeUTF(topic);
+            o.writeInt(partition);
+            o.writeLong(offset);
+            o.writeUTF(metadata == null ? "" : metadata);
+        }));
+    }
+
+    /** @return the group's committed offset for the partition, or -1 if it never committed */
+    public long fetchCommittedOffset(String group, String topic, int partition) throws IOException {
+        return coordinatorRequest(group, KafkaFrame.API_KEY_OFFSET_FETCH, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeUTF(group);
+            o.writeUTF(topic);
+            o.writeInt(partition);
+        })).readLong();
+    }
+
+    /** Sends to the group's coordinator, re-discovering it once if it moved or is unreachable. */
+    DataInputStream coordinatorRequest(String group, short apiKey, byte[] request) throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            BrokerInfo coordinator = findCoordinator(group);
+            try {
+                return connection(coordinator.getHost(), coordinator.getPort()).request(apiKey, request);
+            } catch (IOException e) {
+                boolean retriable = !(e instanceof BrokerErrorException be)
+                        || be.getErrorCode() == KafkaFrame.ERROR_NOT_COORDINATOR;
+                coordinators.remove(group);
+                if (!retriable || attempt >= 1) {
+                    throw e;
+                }
+            }
+        }
     }
 
     /** Assigns consecutive offsets starting at {@code startOffset}; for tests and simple mocks. */
