@@ -1,0 +1,55 @@
+# 3 brokers on an embedded Raft quorum, with S3 tiering to SeaweedFS (S3-compatible; MinIO's
+# community binaries and images are no longer maintained). Not tested on the author's machine
+# (no Docker); scripts/demo-cluster.sh is the verified, Docker-free equivalent.
+#
+#   docker compose up -d --build
+#   docker compose run --rm cli describe
+#   docker compose run --rm cli create-topic orders 3
+#   docker compose kill broker1     # then: docker compose run --rm cli describe
+x-broker: &broker
+  build: .
+  depends_on: [seaweedfs]
+  environment: &broker-env
+    STORMLOG_QUORUM: "1@broker1:9191,2@broker2:9191,3@broker3:9191"
+    STORMLOG_S3_ENDPOINT: "http://seaweedfs:8333"
+    STORMLOG_S3_ACCESS_KEY: "stormlog"
+    STORMLOG_S3_SECRET_KEY: "stormlog-secret"
+    STORMLOG_S3_BUCKET: "stormlog"
+    # Dev-only master key for PII crypto-shredding (32 random bytes, base64). Use KMS in production.
+    STORMLOG_MASTER_KEY: "q0n0cG9ybGVkLWRldi1tYXN0ZXIta2V5LTMyLWJ5dGU="
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./deploy/s3.json:/etc/seaweedfs/s3.json:ro
+    ports: ["8333:8333"]
+
+  broker1:
+    <<: *broker
+    command: ["1", "broker1", "9092", "9191"]
+    ports: ["19092:9092", "20092:10092"]
+    volumes: ["broker1-data:/data"]
+
+  broker2:
+    <<: *broker
+    command: ["2", "broker2", "9092", "9191"]
+    ports: ["19093:9092", "20093:10092"]
+    volumes: ["broker2-data:/data"]
+
+  broker3:
+    <<: *broker
+    command: ["3", "broker3", "9092", "9191"]
+    ports: ["19094:9092", "20094:10092"]
+    volumes: ["broker3-data:/data"]
+
+  cli:
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["java", "-cp", "/app/stormlog.jar", "com.simplekafka.cli.StormLogCli", "--bootstrap", "broker1:9092"]
+
+volumes:
+  broker1-data:
+  broker2-data:
+  broker3-data:
