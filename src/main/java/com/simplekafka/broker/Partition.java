@@ -1,6 +1,8 @@
 package com.simplekafka.broker;
 
 import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
+import com.simplekafka.tiered.RemoteSegmentId;
+import com.simplekafka.tiered.TieredStorageConfig;
 
 import java.io.DataInputStream;
 import java.io.File;
@@ -19,7 +21,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -52,6 +61,12 @@ public class Partition {
 
     private final int id;
     private final DurabilityMode durabilityMode;
+    private final TieredStorageConfig tiered;
+    private final String topicName;
+    private final Set<CompletableFuture<Void>> pendingUploads = ConcurrentHashMap.newKeySet();
+    private final Map<Long, CompletableFuture<Void>> inflightDownloads = new ConcurrentHashMap<>();
+    // Access-ordered: least recently read cached remote segment first
+    private final LinkedHashMap<Long, Boolean> remoteCache = new LinkedHashMap<>(16, 0.75f, true);
     private int leader;
     private List<Integer> followers;
     private final String baseDir;
@@ -73,8 +88,18 @@ public class Partition {
     }
 
     public Partition(int id, String topicBaseDir, DurabilityMode durabilityMode) {
+        this(id, topicBaseDir, durabilityMode, null);
+    }
+
+    /**
+     * @param tiered remote storage for sealed segments, or null to keep everything local.
+     *               Tiered partitions cannot be compacted (as in Kafka).
+     */
+    public Partition(int id, String topicBaseDir, DurabilityMode durabilityMode, TieredStorageConfig tiered) {
         this.id = id;
         this.durabilityMode = durabilityMode;
+        this.tiered = tiered;
+        this.topicName = new File(topicBaseDir).getName();
         this.baseDir = topicBaseDir + File.separator + "partition-" + id;
         this.nextOffset = new AtomicLong(0);
         this.lock = new ReentrantReadWriteLock();
@@ -88,6 +113,10 @@ public class Partition {
         File logFile;
         File indexFile;
         long currentMessageCount;
+
+        // Tiered storage state, guarded by the partition lock
+        boolean uploaded;
+        boolean local = true;
 
         public SegmentInfo(long baseOffset, File logFile, File indexFile, long currentMessageCount) {
             this.baseOffset = baseOffset;
@@ -135,6 +164,7 @@ public class Partition {
                     segments.add(new SegmentInfo(baseOffset, file, indexFile, messageCount));
                 }
                 
+                loadRemoteManifest();
                 segments.sort(Comparator.comparingLong(s -> s.baseOffset));
                 
                 SegmentInfo lastSegment = segments.get(segments.size() - 1);
@@ -144,6 +174,13 @@ public class Partition {
                 // .meta covers offsets compaction removed from the tail (e.g. tombstoned keys)
                 nextOffset.set(Math.max(fromIndex, readMetaNextOffset()));
                 openSegmentForAppend(lastSegment);
+                if (tiered != null) {
+                    for (SegmentInfo segment : new ArrayList<>(segments.subList(0, segments.size() - 1))) {
+                        if (!segment.uploaded) {
+                            scheduleUpload(segment); // sealed before a crash, never uploaded
+                        }
+                    }
+                }
             } else {
                 createNewSegment(0);
                 nextOffset.set(readMetaNextOffset());
@@ -255,8 +292,10 @@ public class Partition {
     public long appendBuffered(byte[] message) throws IOException {
         lock.writeLock().lock();
         try {
-            if (activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
+            if (activeLogChannel.size() > 0 && activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
+                SegmentInfo sealed = segments.get(segments.size() - 1);
                 createNewSegment(nextOffset.get());
+                scheduleUpload(sealed);
             }
 
             long currentPosition = activeLogChannel.position();
@@ -391,8 +430,23 @@ public class Partition {
             int bytesRead = 0;
             for (int s = findSegmentIndex(Math.max(offset, 0)); s < segments.size(); s++) {
                 SegmentInfo segment = segments.get(s);
-                try (RandomAccessFile index = new RandomAccessFile(segment.indexFile, "r");
-                     RandomAccessFile log = new RandomAccessFile(segment.logFile, "r")) {
+                if (!segment.local && !isCached(segment.baseOffset)) {
+                    if (!records.isEmpty()) {
+                        return records; // next fetch downloads it
+                    }
+                    lock.readLock().unlock();
+                    try {
+                        // Download outside the lock so appends aren't stalled by remote I/O
+                        downloadToCache(segment.baseOffset);
+                    } finally {
+                        lock.readLock().lock();
+                    }
+                    // Segments may have changed while unlocked; re-resolve (records is still empty)
+                    s = findSegmentIndex(Math.max(offset, 0)) - 1;
+                    continue;
+                }
+                try (RandomAccessFile index = new RandomAccessFile(readableIndex(segment), "r");
+                     RandomAccessFile log = new RandomAccessFile(readableLog(segment), "r")) {
                     long entries = index.length() / INDEX_ENTRY_BYTES;
                     for (long e = firstEntryAtOrAfter(index, entries, offset); e < entries; e++) {
                         index.seek(e * INDEX_ENTRY_BYTES);
@@ -492,6 +546,9 @@ public class Partition {
      * and deletes tombstones (records with empty payload).
      */
     public void compact(CompactionKeyExtractor extractor) throws IOException {
+        if (tiered != null) {
+            throw new IOException("Compaction is not supported on tiered partitions (" + topicName + "-" + id + ")");
+        }
         lock.writeLock().lock();
         try {
             List<CompactedRecord> allRecords = readAllRecordsWithOffsets();
@@ -706,6 +763,193 @@ public class Partition {
         }
         return list;
     }
+
+    // ---------------------------------------------------------------------------------
+    // Tiered storage: sealed segments are uploaded asynchronously on roll. Once uploaded,
+    // all but the newest N sealed segments lose their local copy and are read through an
+    // LRU cache of downloaded segments. The active segment is always local.
+    // ---------------------------------------------------------------------------------
+
+    private static final String REMOTE_MANIFEST = ".remote_segments";
+    private static final String REMOTE_CACHE_DIR = ".remote_cache";
+
+    /** Called with the write lock held, or from initialize(). */
+    private void scheduleUpload(SegmentInfo segment) {
+        if (tiered == null) {
+            return;
+        }
+        RemoteSegmentId remoteId = new RemoteSegmentId(topicName, id, segment.baseOffset);
+        CompletableFuture<Void> upload = tiered.remote()
+                .copySegment(remoteId, segment.logFile.toPath(), segment.indexFile.toPath())
+                .thenRun(() -> onUploaded(segment));
+        pendingUploads.add(upload);
+        upload.whenComplete((v, e) -> {
+            pendingUploads.remove(upload);
+            if (e != null) {
+                // Stays local and un-uploaded; retried on the next broker start
+                LOGGER.log(Level.WARNING, "Partition " + topicName + "-" + id + ": upload of segment "
+                        + segment.baseOffset + " failed", e);
+            }
+        });
+    }
+
+    private void onUploaded(SegmentInfo segment) {
+        lock.writeLock().lock();
+        try {
+            segment.uploaded = true;
+            writeRemoteManifest();
+            enforceLocalRetention();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Deletes local copies of uploaded sealed segments beyond the newest N. Write lock held. */
+    private void enforceLocalRetention() {
+        int keep = tiered.localRetainedSealedSegments();
+        if (keep < 0) {
+            return;
+        }
+        int retained = 0;
+        for (int i = segments.size() - 2; i >= 0; i--) { // newest sealed segment first
+            SegmentInfo segment = segments.get(i);
+            if (!segment.local) {
+                continue;
+            }
+            if (!segment.uploaded || retained < keep) {
+                retained++;
+                continue;
+            }
+            segment.logFile.delete();
+            segment.indexFile.delete();
+            segment.local = false;
+        }
+    }
+
+    /** Lines of "baseOffset recordCount" for every uploaded segment; written atomically. */
+    private void writeRemoteManifest() throws IOException {
+        StringBuilder manifest = new StringBuilder();
+        for (SegmentInfo segment : segments) {
+            if (segment.uploaded) {
+                manifest.append(segment.baseOffset).append(' ').append(segment.currentMessageCount).append('\n');
+            }
+        }
+        Path tmp = Paths.get(baseDir, REMOTE_MANIFEST + ".tmp");
+        Files.writeString(tmp, manifest.toString());
+        Files.move(tmp, Paths.get(baseDir, REMOTE_MANIFEST), StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** Merges uploaded segments into the segment list; those without local files are remote-only. */
+    private void loadRemoteManifest() throws IOException {
+        Path manifest = Paths.get(baseDir, REMOTE_MANIFEST);
+        if (!Files.exists(manifest)) {
+            return;
+        }
+        for (String line : Files.readAllLines(manifest)) {
+            if (line.isBlank()) {
+                continue;
+            }
+            String[] parts = line.trim().split(" ");
+            long base = Long.parseLong(parts[0]);
+            long count = Long.parseLong(parts[1]);
+            SegmentInfo existing = null;
+            for (SegmentInfo segment : segments) {
+                if (segment.baseOffset == base) {
+                    existing = segment;
+                }
+            }
+            if (existing == null) {
+                existing = new SegmentInfo(base, new File(baseDir, String.format("%020d.log", base)),
+                        new File(baseDir, String.format("%020d.index", base)), count);
+                existing.local = false;
+                segments.add(existing);
+            }
+            existing.uploaded = true;
+        }
+    }
+
+    private File cacheDir() {
+        return new File(baseDir, REMOTE_CACHE_DIR);
+    }
+
+    private File readableLog(SegmentInfo segment) {
+        return segment.local ? segment.logFile : new File(cacheDir(), String.format("%020d.log", segment.baseOffset));
+    }
+
+    private File readableIndex(SegmentInfo segment) {
+        return segment.local ? segment.indexFile : new File(cacheDir(), String.format("%020d.index", segment.baseOffset));
+    }
+
+    private boolean isCached(long baseOffset) {
+        synchronized (remoteCache) {
+            return remoteCache.get(baseOffset) != null; // get() also refreshes LRU order
+        }
+    }
+
+    /** Downloads a remote segment into the cache; concurrent readers share one download. */
+    private void downloadToCache(long baseOffset) throws IOException {
+        CompletableFuture<Void> download = inflightDownloads.computeIfAbsent(baseOffset, base -> {
+            File dir = cacheDir();
+            dir.mkdirs();
+            File log = new File(dir, String.format("%020d.log", base));
+            File index = new File(dir, String.format("%020d.index", base));
+            return tiered.remote()
+                    .fetchSegment(new RemoteSegmentId(topicName, id, base), log.toPath(), index.toPath())
+                    .thenRun(() -> {
+                        synchronized (remoteCache) {
+                            remoteCache.put(base, Boolean.TRUE);
+                            evictCacheOverflow();
+                        }
+                    })
+                    .whenComplete((v, e) -> inflightDownloads.remove(base));
+        });
+        try {
+            download.get(60, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted downloading remote segment " + baseOffset, e);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new IOException("Failed to download remote segment " + topicName + "-" + id + "@" + baseOffset,
+                    e instanceof ExecutionException ? e.getCause() : e);
+        }
+    }
+
+    private void evictCacheOverflow() {
+        var it = remoteCache.keySet().iterator();
+        while (remoteCache.size() > tiered.cachedRemoteSegments() && it.hasNext()) {
+            long evicted = it.next();
+            it.remove();
+            new File(cacheDir(), String.format("%020d.log", evicted)).delete();
+            new File(cacheDir(), String.format("%020d.index", evicted)).delete();
+        }
+    }
+
+    /** Completes when every upload scheduled so far has finished (for tests and shutdown). */
+    public CompletableFuture<Void> awaitTieringIdle() {
+        return CompletableFuture.allOf(pendingUploads.toArray(new CompletableFuture[0]))
+                .exceptionally(e -> null);
+    }
+
+    /** Base offsets of segments whose only copy is remote. */
+    public List<Long> remoteOnlySegments() {
+        lock.readLock().lock();
+        try {
+            List<Long> result = new ArrayList<>();
+            for (SegmentInfo segment : segments) {
+                if (!segment.local) {
+                    result.add(segment.baseOffset);
+                }
+            }
+            return result;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public String getTopicName() { return topicName; }
 
     public int getId() { return id; }
     public String getBaseDir() { return baseDir; }

@@ -7,6 +7,8 @@ import com.simplekafka.network.IdempotenceManager;
 import com.simplekafka.network.NettyBrokerServer;
 import com.simplekafka.network.ProducerIdManager;
 import com.simplekafka.storage.WriteAheadLog.DurabilityMode;
+import com.simplekafka.tiered.S3RemoteStorageManager;
+import com.simplekafka.tiered.TieredStorageConfig;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonArray;
 
@@ -42,6 +44,7 @@ public class SimpleKafkaBroker {
     private final Gson gson;
     private final ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Void>> topicCreationGuards = new ConcurrentHashMap<>();
     private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
+    private volatile TieredStorageConfig tieredStorage;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -311,10 +314,11 @@ public class SimpleKafkaBroker {
 
                     if (leader == brokerId || replicas.contains(brokerId)) {
                         String baseDir = DATA_DIR + File.separator + brokerId + File.separator + topic;
-                        Partition partition = new Partition(i, baseDir, durabilityMode);
-                        if (config.has("cleanup.policy") && "compact".equalsIgnoreCase(config.get("cleanup.policy").getAsString())) {
-                            partition.setCompacted(true);
-                        }
+                        boolean compacted = config.has("cleanup.policy")
+                                && "compact".equalsIgnoreCase(config.get("cleanup.policy").getAsString());
+                        // Compacted topics stay local: compaction rewrites whole partitions (Kafka has the same limit)
+                        Partition partition = new Partition(i, baseDir, durabilityMode, compacted ? null : tieredStorage);
+                        partition.setCompacted(compacted);
                         partition.setLeader(leader);
                         List<Integer> followers = new ArrayList<>(replicas);
                         followers.remove((Integer) leader);
@@ -433,6 +437,11 @@ public class SimpleKafkaBroker {
         return durabilityMode;
     }
 
+    /** Remote tier for sealed segments of non-compacted topics opened from now on; null disables. */
+    public void setTieredStorage(TieredStorageConfig tieredStorage) {
+        this.tieredStorage = tieredStorage;
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length < 4) {
             System.err.println("Usage: SimpleKafkaBroker <brokerId> <host> <port> <zkPort> [OS_PAGE_CACHE|PHYSICAL_FSYNC]");
@@ -447,6 +456,17 @@ public class SimpleKafkaBroker {
         SimpleKafkaBroker broker = new SimpleKafkaBroker(brokerId, host, port, zkPort);
         if (args.length >= 5) {
             broker.setDurabilityMode(DurabilityMode.valueOf(args[4]));
+        }
+        String s3Endpoint = System.getenv("STORMLOG_S3_ENDPOINT");
+        if (s3Endpoint != null && !s3Endpoint.isBlank()) {
+            S3RemoteStorageManager s3 = S3RemoteStorageManager.create(s3Endpoint,
+                    System.getenv().getOrDefault("STORMLOG_S3_REGION", "us-east-1"),
+                    System.getenv("STORMLOG_S3_ACCESS_KEY"), System.getenv("STORMLOG_S3_SECRET_KEY"),
+                    System.getenv().getOrDefault("STORMLOG_S3_BUCKET", "stormlog"));
+            s3.ensureBucket().join();
+            broker.setTieredStorage(new TieredStorageConfig(s3,
+                    Integer.parseInt(System.getenv().getOrDefault("STORMLOG_LOCAL_RETAINED_SEGMENTS", "2")),
+                    Integer.parseInt(System.getenv().getOrDefault("STORMLOG_REMOTE_CACHE_SEGMENTS", "8"))));
         }
         broker.start();
         
