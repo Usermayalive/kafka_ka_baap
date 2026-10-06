@@ -104,6 +104,7 @@ public class SimpleKafkaBroker {
         int resolvedAdminPort = adminPort >= 0 ? adminPort : (brokerPort == 0 ? 0 : brokerPort + 1000);
         adminServer = new AdminHttpServer(brokerHost, resolvedAdminPort, metrics, this::partitionLag);
         LOGGER.info("Admin HTTP (/metrics, /admin/lag) on " + brokerHost + ":" + adminServer.port());
+        registerQuorumAdminRoutes();
 
         List<MetadataQuorum.Peer> voters = quorumVoters != null ? quorumVoters
                 : List.of(new MetadataQuorum.Peer(brokerId, brokerHost, raftPort));
@@ -438,6 +439,51 @@ public class SimpleKafkaBroker {
 
     public MetadataLog getMetadataLog() {
         return zkClient;
+    }
+
+    /**
+     * GET  /admin/quorum                              leader, voters, learners
+     * POST /admin/quorum/learners?id=&host=&port=     add a non-voting learner (call on the leader)
+     * POST /admin/quorum/promote?ids=4,5              promote caught-up learners (409 if even/not caught up)
+     */
+    private void registerQuorumAdminRoutes() {
+        adminServer.route("/admin/quorum/learners", (method, params) -> {
+            if (!"POST".equals(method)) {
+                return new Object[]{405, "{\"error\":\"POST required\"}"};
+            }
+            zkClient.quorum().addListener(new MetadataQuorum.Peer(Integer.parseInt(params.get("id")),
+                    params.get("host"), Integer.parseInt(params.get("port"))));
+            return new Object[]{200, quorumJson()};
+        });
+        adminServer.route("/admin/quorum/promote", (method, params) -> {
+            if (!"POST".equals(method)) {
+                return new Object[]{405, "{\"error\":\"POST required\"}"};
+            }
+            List<Integer> ids = new ArrayList<>();
+            for (String id : params.getOrDefault("ids", "").split(",")) {
+                if (!id.isBlank()) {
+                    ids.add(Integer.parseInt(id.trim()));
+                }
+            }
+            try {
+                zkClient.quorum().promote(ids);
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                JsonObject error = new JsonObject();
+                error.addProperty("error", e.getMessage());
+                return new Object[]{409, error.toString()};
+            }
+            return new Object[]{200, quorumJson()};
+        });
+        adminServer.route("/admin/quorum", (method, params) -> new Object[]{200, quorumJson()});
+    }
+
+    private String quorumJson() throws IOException {
+        JsonObject o = new JsonObject();
+        o.addProperty("self", brokerId);
+        o.addProperty("leader", zkClient.quorum().leaderId());
+        o.add("voters", gson.toJsonTree(zkClient.quorum().voterIds()));
+        o.add("learners", gson.toJsonTree(zkClient.quorum().listenerIds()));
+        return o.toString();
     }
 
     /** Simulates a crash: stops serving without unregistering, so the leader must detect it by missed heartbeats. */

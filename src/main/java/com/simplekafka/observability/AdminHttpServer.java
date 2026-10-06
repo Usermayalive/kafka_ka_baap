@@ -40,6 +40,24 @@ public class AdminHttpServer implements AutoCloseable {
         server.start();
     }
 
+    /** A handler returns [status, json body]; query parameters are pre-parsed. */
+    @FunctionalInterface
+    public interface Route {
+        Object[] handle(String method, Map<String, String> params) throws Exception;
+    }
+
+    /** Registers an extra admin endpoint (e.g. quorum membership). */
+    public void route(String path, Route route) {
+        server.createContext(path, ex -> {
+            try {
+                Object[] result = route.handle(ex.getRequestMethod(), query(ex));
+                respond(ex, (Integer) result[0], "application/json", (String) result[1]);
+            } catch (Exception e) {
+                respond(ex, 500, "application/json", "{\"error\":\"" + String.valueOf(e.getMessage()).replace("\"", "'") + "\"}");
+            }
+        });
+    }
+
     public int port() {
         return server.getAddress().getPort();
     }
