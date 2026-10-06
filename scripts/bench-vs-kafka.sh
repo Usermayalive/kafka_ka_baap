@@ -17,10 +17,11 @@ WORK=${WORK:-$(mktemp -d)}
 JAR=target-cli/simple-kafka-1.0-SNAPSHOT.jar
 SIZES=${SIZES:-"64 256 1024 4096 16384"}
 LATENCY_RATE=${LATENCY_RATE:-5000}   # records/s for the fixed-rate latency pass (below both systems' saturation)
-LATENCY_RECORDS=${LATENCY_RECORDS:-50000}
-DISK=${DISK:-disk0}
+# 60 s per size: long enough that producer startup (metadata fetch, warmup), which
+# kafka-producer-perf-test includes in its percentiles, stays well under 1% of samples
+LATENCY_RECORDS=${LATENCY_RECORDS:-300000}
 mkdir -p "$(dirname "$OUT")"
-echo "system,mode,record_size,records,seconds,records_per_sec,mb_per_sec,p50_ms,p99_ms,broker_cpu_cores,disk_mb_written" > "$OUT"
+echo "system,mode,record_size,records,seconds,records_per_sec,mb_per_sec,p50_ms,p99_ms,broker_cpu_cores,broker_disk_mb_written" > "$OUT"
 
 records_for() { # keep each run to a few seconds
   case $1 in 64|256) echo 300000 ;; 1024) echo 200000 ;; 4096) echo 100000 ;; *) echo 40000 ;; esac
@@ -28,14 +29,14 @@ records_for() { # keep each run to a few seconds
 cpu_seconds() { # cumulative CPU time of a process, from ps TIME ([[dd-]hh:]mm:ss.ss)
   ps -o time= -p "$1" | awk -F'[:-]' '{ s=0; for (i=1;i<=NF;i++) s=s*60+$i; print s }'
 }
-disk_mb() { iostat -Id "$DISK" | tail -1 | awk '{print $3}'; }
+disk_mb() { python3 scripts/proc_disk_written.py "$1"; } # this broker process only (macOS rusage)
 
 measure() { # measure PID SYSTEM MODE SIZE RECORDS COMMAND... ; command prints records/s,MB/s,p50,p99,seconds
   local pid=$1 system=$2 mode=$3 size=$4 records=$5; shift 5
   local cpu0 disk0 t0 out cpu1 disk1 t1
-  cpu0=$(cpu_seconds "$pid"); disk0=$(disk_mb); t0=$(python3 -c 'import time;print(time.time())')
+  cpu0=$(cpu_seconds "$pid"); disk0=$(disk_mb "$pid"); t0=$(python3 -c 'import time;print(time.time())')
   out=$("$@")
-  t1=$(python3 -c 'import time;print(time.time())'); cpu1=$(cpu_seconds "$pid"); disk1=$(disk_mb)
+  t1=$(python3 -c 'import time;print(time.time())'); cpu1=$(cpu_seconds "$pid"); disk1=$(disk_mb "$pid")
   python3 - "$out" "$system" "$mode" "$size" "$records" "$cpu0" "$cpu1" "$t0" "$t1" "$disk0" "$disk1" >> "$OUT" <<'PY'
 import sys
 out, system, mode, size, records, cpu0, cpu1, t0, t1, d0, d1 = sys.argv[1:]
