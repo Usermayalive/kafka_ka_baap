@@ -84,6 +84,10 @@ public class SimpleKafkaClient implements AutoCloseable {
         return layout(topic).size();
     }
 
+    public Map<String, List<PartitionLayout>> topicLayouts() {
+        return new java.util.TreeMap<>(topicLayouts);
+    }
+
     public Map<Integer, BrokerInfo> getBrokers() {
         return clusterBrokers;
     }

@@ -334,7 +334,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         String topic = dis.readUTF();
         int partitions = dis.readInt();
         short replicationFactor = dis.readShort();
-        if (!broker.isController()) {
+        if (!broker.canCreateTopics()) {
             return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                     KafkaFrame.ERROR_NOT_CONTROLLER, "Broker " + broker.getBrokerId() + " is not the controller");
         }

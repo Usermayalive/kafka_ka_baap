@@ -235,7 +235,7 @@ public class SimpleKafkaBroker {
     public volatile Runnable preTopicCreationHook = null;
 
     public void createTopic(String topic, int numPartitions, short replicationFactor) {
-        if (!isController.get()) {
+        if (!canCreateTopics()) {
             LOGGER.warning("Only controller can create topics");
             return;
         }
@@ -318,6 +318,16 @@ public class SimpleKafkaBroker {
             }
 
             myFuture.complete(null);
+        } catch (IllegalStateException e) {
+            if (String.valueOf(e.getMessage()).startsWith("Topic already exists")) {
+                // Another broker's CREATE_TOPIC won the race through the Raft log: same outcome
+                loadTopic(topic);
+                myFuture.complete(null);
+                return;
+            }
+            myFuture.completeExceptionally(e);
+            topicCreationGuards.remove(topic);
+            throw new RuntimeException("Failed to create topic: " + topic, e);
         } catch (Exception e) {
             myFuture.completeExceptionally(e);
             topicCreationGuards.remove(topic);
@@ -755,13 +765,22 @@ public class SimpleKafkaBroker {
                     }
                 }
             }
-            if (attempt == 0 && isController()) {
+            if (attempt == 0 && canCreateTopics()) {
                 createTopic(ConsumerOffsetStore.TOPIC, ConsumerOffsetStore.PARTITIONS, (short) 1);
             } else {
                 break;
             }
         }
         return null;
+    }
+
+    /**
+     * With the Raft quorum any broker may propose CREATE_TOPIC: proposals are serialized by the
+     * log and duplicates are rejected atomically by the state machine. Without a quorum
+     * (standalone), only the controller may.
+     */
+    public boolean canCreateTopics() {
+        return isController.get() || zkClient != null;
     }
 
     public boolean isController() {
