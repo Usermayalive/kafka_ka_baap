@@ -3,6 +3,7 @@ package com.simplekafka.broker;
 
 import com.google.gson.Gson;
 import com.simplekafka.coordinator.ConsumerOffsetStore;
+import com.simplekafka.coordinator.GroupCoordinator;
 import com.simplekafka.network.ClientQuotaManager;
 import com.simplekafka.network.IdempotenceManager;
 import com.simplekafka.network.NettyBrokerServer;
@@ -47,6 +48,7 @@ public class SimpleKafkaBroker {
     private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
     private volatile TieredStorageConfig tieredStorage;
     private final ConsumerOffsetStore offsetStore = new ConsumerOffsetStore(p -> hostedPartition(ConsumerOffsetStore.TOPIC, p));
+    private final GroupCoordinator groupCoordinator = new GroupCoordinator(this::partitionCount);
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -416,6 +418,20 @@ public class SimpleKafkaBroker {
             }
             return local;
         }
+    }
+
+    public GroupCoordinator getGroupCoordinator() {
+        return groupCoordinator;
+    }
+
+    /** Partition count of a topic from cluster metadata, or 0 if it doesn't exist. */
+    public int partitionCount(String topic) {
+        for (TopicDescription t : describeTopics()) {
+            if (t.name().equals(topic)) {
+                return t.partitions().size();
+            }
+        }
+        return 0;
     }
 
     public ConsumerOffsetStore getOffsetStore() {

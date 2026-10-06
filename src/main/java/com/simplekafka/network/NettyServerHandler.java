@@ -118,6 +118,11 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                 return handleOffsetCommit(frame);
             case KafkaFrame.API_KEY_OFFSET_FETCH:
                 return handleOffsetFetch(frame);
+            case KafkaFrame.API_KEY_JOIN_GROUP:
+            case KafkaFrame.API_KEY_SYNC_GROUP:
+            case KafkaFrame.API_KEY_HEARTBEAT:
+            case KafkaFrame.API_KEY_LEAVE_GROUP:
+                return handleGroupRequest(frame);
             default:
                 return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                         KafkaFrame.ERROR_CORRUPT_MESSAGE, "Unknown apiKey: " + frame.getApiKey());
@@ -354,6 +359,75 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             out.writeLong(committed == null ? -1L : committed.offset());
             out.writeUTF(committed == null ? "" : committed.metadata());
         });
+    }
+
+    /**
+     * JOIN:      [clientId][group][memberId][instanceId][sessionTimeoutMs:4][n]{topic}
+     *            -> [error][memberId][generation:4]
+     * SYNC:      [clientId][group][memberId][n]{[topic][partition:4]} (owned)
+     *            -> [error][generation:4][n]{[topic][partition:4]} (grantable assignment)
+     * HEARTBEAT: same request as SYNC -> [error][generation:4][needsSync:1]
+     * LEAVE:     [clientId][group][memberId] -> [error]
+     */
+    private KafkaFrame handleGroupRequest(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String group = dis.readUTF();
+        KafkaFrame notCoordinator = rejectIfNotCoordinator(frame, group);
+        if (notCoordinator != null) {
+            return notCoordinator;
+        }
+        com.simplekafka.coordinator.GroupCoordinator coordinator = broker.getGroupCoordinator();
+        String memberId = dis.readUTF();
+        try {
+            switch (frame.getApiKey()) {
+                case KafkaFrame.API_KEY_JOIN_GROUP: {
+                    String instanceId = dis.readUTF();
+                    long sessionTimeoutMs = dis.readInt();
+                    java.util.Set<String> topics = new java.util.TreeSet<>();
+                    for (int n = dis.readInt(); n > 0; n--) {
+                        topics.add(dis.readUTF());
+                    }
+                    var joined = coordinator.join(group, memberId, instanceId, topics, sessionTimeoutMs);
+                    return okFrame(frame, out -> {
+                        out.writeUTF(joined.memberId());
+                        out.writeInt(joined.generation());
+                    });
+                }
+                case KafkaFrame.API_KEY_SYNC_GROUP: {
+                    var synced = coordinator.sync(group, memberId, readPartitions(dis));
+                    return okFrame(frame, out -> {
+                        out.writeInt(synced.generation());
+                        out.writeInt(synced.assignment().size());
+                        for (var tp : synced.assignment()) {
+                            out.writeUTF(tp.topic());
+                            out.writeInt(tp.partition());
+                        }
+                    });
+                }
+                case KafkaFrame.API_KEY_HEARTBEAT: {
+                    var beat = coordinator.heartbeat(group, memberId, readPartitions(dis));
+                    return okFrame(frame, out -> {
+                        out.writeInt(beat.generation());
+                        out.writeBoolean(beat.needsSync());
+                    });
+                }
+                default:
+                    coordinator.leave(group, memberId);
+                    return okFrame(frame, out -> {});
+            }
+        } catch (com.simplekafka.coordinator.GroupCoordinator.UnknownMemberException e) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_UNKNOWN_MEMBER, e.getMessage());
+        }
+    }
+
+    private static java.util.Set<com.simplekafka.coordinator.GroupCoordinator.TopicPartition> readPartitions(DataInputStream dis)
+            throws IOException {
+        java.util.Set<com.simplekafka.coordinator.GroupCoordinator.TopicPartition> result = new java.util.TreeSet<>();
+        for (int n = dis.readInt(); n > 0; n--) {
+            result.add(new com.simplekafka.coordinator.GroupCoordinator.TopicPartition(dis.readUTF(), dis.readInt()));
+        }
+        return result;
     }
 
     private KafkaFrame rejectIfNotCoordinator(KafkaFrame frame, String group) {

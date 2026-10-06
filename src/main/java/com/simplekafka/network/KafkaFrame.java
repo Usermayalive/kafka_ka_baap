@@ -24,6 +24,10 @@ public class KafkaFrame {
     public static final short API_KEY_FIND_COORDINATOR = 6;
     public static final short API_KEY_OFFSET_COMMIT = 7;
     public static final short API_KEY_OFFSET_FETCH = 8;
+    public static final short API_KEY_JOIN_GROUP = 9;
+    public static final short API_KEY_SYNC_GROUP = 10;
+    public static final short API_KEY_HEARTBEAT = 11;
+    public static final short API_KEY_LEAVE_GROUP = 12;
 
     // Error Codes
     public static final short ERROR_NONE = 0;
@@ -38,6 +42,7 @@ public class KafkaFrame {
     public static final short ERROR_NOT_CONTROLLER = 1008;
     public static final short ERROR_NOT_COORDINATOR = 1009;
     public static final short ERROR_COORDINATOR_NOT_AVAILABLE = 1010;
+    public static final short ERROR_UNKNOWN_MEMBER = 1011;
 
     /** Produce with this producer ID to bypass idempotence (Kafka's NO_PRODUCER_ID). */
     public static final long NO_PRODUCER_ID = -1L;
