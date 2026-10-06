@@ -5,6 +5,9 @@ import com.google.gson.Gson;
 import com.simplekafka.coordinator.ConsumerOffsetStore;
 import com.simplekafka.coordinator.GroupCoordinator;
 import com.simplekafka.network.ClientQuotaManager;
+import com.simplekafka.observability.AdminHttpServer;
+import com.simplekafka.observability.AuditLog;
+import com.simplekafka.observability.BrokerMetrics;
 import com.simplekafka.network.IdempotenceManager;
 import com.simplekafka.network.NettyBrokerServer;
 import com.simplekafka.network.ProducerIdManager;
@@ -27,7 +30,7 @@ import java.util.logging.Logger;
 
 public class SimpleKafkaBroker {
     private static final Logger LOGGER = Logger.getLogger(SimpleKafkaBroker.class.getName());
-    private static final String DATA_DIR = "kafka-data";
+    private static final String DATA_DIR = System.getProperty("stormlog.data.dir", "kafka-data");
     
     private final int brokerId;
 
@@ -48,7 +51,12 @@ public class SimpleKafkaBroker {
     private volatile DurabilityMode durabilityMode = DurabilityMode.OS_PAGE_CACHE;
     private volatile TieredStorageConfig tieredStorage;
     private final ConsumerOffsetStore offsetStore = new ConsumerOffsetStore(p -> hostedPartition(ConsumerOffsetStore.TOPIC, p));
-    private final GroupCoordinator groupCoordinator = new GroupCoordinator(this::partitionCount);
+    private final GroupCoordinator groupCoordinator = new GroupCoordinator(this::partitionCount,
+            (event, details) -> audit().record(event, details));
+    private final BrokerMetrics metrics;
+    private volatile AuditLog auditLog;
+    private volatile AdminHttpServer adminServer;
+    private volatile int adminPort = -1;
 
     public SimpleKafkaBroker(int brokerId, String host, int port, int zkPort) throws IOException {
         this.brokerId = brokerId;
@@ -59,6 +67,11 @@ public class SimpleKafkaBroker {
         this.isController = new AtomicBoolean(false);
         this.clusterMetadata = new ConcurrentHashMap<>();
         this.gson = new Gson();
+        this.metrics = new BrokerMetrics(brokerId);
+        metrics.gauge("stormlog.topics", "Topics with partitions hosted on this broker", topics::size);
+        metrics.gauge("stormlog.consumer.groups", "Consumer groups coordinated by this broker",
+                () -> groupCoordinator.groupIds().size());
+        metrics.setLagSource(this::lagByGroupAndTopic);
         
         // Initialize data directory
         File dataDir = new File(DATA_DIR + File.separator + brokerId);
@@ -79,11 +92,16 @@ public class SimpleKafkaBroker {
                 new ProducerIdManager((short) brokerId, new File(DATA_DIR + File.separator + brokerId, "producer_id_epoch")),
                 NettyBrokerServer.DEFAULT_REQUEST_QUEUE_CAPACITY);
         nettyServer.start();
+        int resolvedAdminPort = adminPort >= 0 ? adminPort : (brokerPort == 0 ? 0 : brokerPort + 1000);
+        adminServer = new AdminHttpServer(brokerHost, resolvedAdminPort, metrics, this::partitionLag);
+        LOGGER.info("Admin HTTP (/metrics, /admin/lag) on " + brokerHost + ":" + adminServer.port());
 
         zkClient.connect();
         registerWithZookeeper();
         electController();
         loadExistingTopics();
+        offsetStore.loadAllHosted();
+        audit().record("BROKER_STARTED", java.util.Map.of("host", brokerHost, "port", getPort()));
     }
 
     public void stop() {
@@ -92,6 +110,10 @@ public class SimpleKafkaBroker {
             if (nettyServer != null) {
                 nettyServer.stop();
             }
+            if (adminServer != null) {
+                adminServer.close();
+            }
+            groupCoordinator.close();
             zkClient.close();
             LOGGER.info("Broker " + brokerId + " stopped");
         } catch (Exception e) {
@@ -277,6 +299,8 @@ public class SimpleKafkaBroker {
             
             loadTopic(topic);
             LOGGER.info("Topic created and loaded: " + topic);
+            audit().record("TOPIC_CREATED", java.util.Map.of("topic", topic, "partitions", numPartitions,
+                    "replicationFactor", replicationFactor));
 
             // Auto-provision companion DLQ topic with 1 partition if eligible (excludes internal topics)
             if (com.simplekafka.client.DeadLetterRouter.isEligibleForDlq(topic)) {
@@ -418,6 +442,87 @@ public class SimpleKafkaBroker {
             }
             return local;
         }
+    }
+
+    public BrokerMetrics getMetrics() {
+        return metrics;
+    }
+
+    /** Admin HTTP port; -1 (default) means broker port + 1000, 0 means ephemeral. Set before start(). */
+    public void setAdminPort(int adminPort) {
+        this.adminPort = adminPort;
+    }
+
+    public int getAdminPort() {
+        return adminServer != null ? adminServer.port() : -1;
+    }
+
+    /**
+     * The audit log, backed by this broker's local {@code __audit} partition (created on first
+     * use and exposed as a topic so it can be consumed like any other).
+     */
+    public AuditLog audit() {
+        AuditLog log = auditLog;
+        if (log == null) {
+            synchronized (this) {
+                if (auditLog == null) {
+                    auditLog = new AuditLog(brokerId, () -> {
+                        Partition p = hostedPartition(AuditLog.TOPIC, 0);
+                        if (p == null) {
+                            synchronized (topics) {
+                                p = hostedPartition(AuditLog.TOPIC, 0);
+                                if (p == null) {
+                                    p = new Partition(0, dataDir() + File.separator + AuditLog.TOPIC, durabilityMode);
+                                    topics.put(AuditLog.TOPIC, new ArrayList<>(List.of(p)));
+                                }
+                            }
+                        }
+                        return p;
+                    });
+                }
+                log = auditLog;
+            }
+        }
+        return log;
+    }
+
+    /** Root directory for this broker's partitions; overridable for tests. */
+    protected String dataDir() {
+        return DATA_DIR + File.separator + brokerId;
+    }
+
+    /** Lag per (group, topic) over locally hosted partitions with a committed offset. */
+    private List<BrokerMetrics.LagRow> lagByGroupAndTopic() {
+        Map<String, Long> sums = new java.util.TreeMap<>();
+        for (AdminHttpServer.PartitionLag row : partitionLag(null)) {
+            sums.merge(row.group() + "\u0000" + row.topic(), row.lag(), Long::sum);
+        }
+        List<BrokerMetrics.LagRow> rows = new ArrayList<>();
+        sums.forEach((key, lag) -> {
+            String[] parts = key.split("\u0000", 2);
+            rows.add(new BrokerMetrics.LagRow(parts[0], parts[1], lag));
+        });
+        return rows;
+    }
+
+    /** Per-partition lag for one group (or all groups when null), locally hosted partitions only. */
+    public List<AdminHttpServer.PartitionLag> partitionLag(String group) {
+        List<AdminHttpServer.PartitionLag> rows = new ArrayList<>();
+        for (ConsumerOffsetStore.CommittedOffset c : offsetStore.snapshot()) {
+            if (group != null && !group.equals(c.group())) {
+                continue;
+            }
+            Partition p = hostedPartition(c.topic(), c.partition());
+            if (p != null) {
+                long end = p.getNextOffset();
+                rows.add(new AdminHttpServer.PartitionLag(c.group(), c.topic(), c.partition(), c.offset(), end,
+                        Math.max(0, end - c.offset())));
+            }
+        }
+        rows.sort(java.util.Comparator.comparing(AdminHttpServer.PartitionLag::group)
+                .thenComparing(AdminHttpServer.PartitionLag::topic)
+                .thenComparingInt(AdminHttpServer.PartitionLag::partition));
+        return rows;
     }
 
     public GroupCoordinator getGroupCoordinator() {

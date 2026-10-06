@@ -42,6 +42,9 @@ public class GroupConsumerTest {
             @Override public List<BrokerInfo> liveBrokers() {
                 return List.of(new BrokerInfo(1, "127.0.0.1", port[0]));
             }
+            @Override protected String dataDir() {
+                return tempDir.getAbsolutePath();
+            }
         };
         List<Partition> orders = new ArrayList<>();
         List<Partition> offsets = new ArrayList<>();

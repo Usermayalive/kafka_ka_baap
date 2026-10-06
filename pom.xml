@@ -89,6 +89,13 @@
             <version>1.5.7-21</version>
         </dependency>
 
+        <!-- Observability: Prometheus exposition via Micrometer -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <version>1.17.1</version>
+        </dependency>
+
         <!-- Testing -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -115,6 +122,9 @@
                 <version>3.2.5</version>
                 <configuration>
                     <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    <systemPropertyVariables>
+                        <stormlog.data.dir>${project.build.directory}/test-kafka-data</stormlog.data.dir>
+                    </systemPropertyVariables>
                 </configuration>
             </plugin>
             <plugin>

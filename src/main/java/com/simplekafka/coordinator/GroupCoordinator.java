@@ -87,8 +87,20 @@ public class GroupCoordinator {
         return t;
     });
 
+    /** Receives lifecycle events (event name, details), e.g. for the audit log. */
+    public interface GroupEventListener {
+        void onEvent(String event, Map<String, Object> details);
+    }
+
+    private final GroupEventListener listener;
+
     public GroupCoordinator(Function<String, Integer> partitionCount) {
+        this(partitionCount, (event, details) -> {});
+    }
+
+    public GroupCoordinator(Function<String, Integer> partitionCount, GroupEventListener listener) {
         this.partitionCount = partitionCount;
+        this.listener = listener;
         reaper.scheduleWithFixedDelay(this::expireSessions, 100, 100, TimeUnit.MILLISECONDS);
     }
 
@@ -107,6 +119,8 @@ public class GroupCoordinator {
                     existing.owned = new TreeSet<>(); // the restarted process owns nothing yet
                     group.members.put(newId, existing);
                     LOGGER.info("Group " + groupId + ": static member " + instanceId + " rejoined as " + newId);
+                    listener.onEvent("GROUP_STATIC_MEMBER_REJOINED", Map.of("group", groupId, "instance", instanceId,
+                            "member", newId, "generation", group.generation));
                 }
             }
             if (existing != null) {
@@ -119,6 +133,7 @@ public class GroupCoordinator {
             }
             String newId = (instanceId != null && !instanceId.isEmpty() ? instanceId : "member") + "-" + UUID.randomUUID();
             group.members.put(newId, new Member(newId, emptyToNull(instanceId), new TreeSet<>(topics), sessionTimeoutMs));
+            listener.onEvent("GROUP_MEMBER_JOINED", Map.of("group", groupId, "member", newId, "topics", List.copyOf(topics)));
             rebalance(group, newId + " joined");
             return new JoinResult(newId, group.generation);
         }
@@ -156,6 +171,7 @@ public class GroupCoordinator {
         }
         synchronized (group) {
             if (group.members.remove(memberId) != null) {
+                listener.onEvent("GROUP_MEMBER_LEFT", Map.of("group", groupId, "member", memberId));
                 rebalance(group, memberId + " left");
             }
         }
@@ -200,6 +216,7 @@ public class GroupCoordinator {
                 }
                 if (!expired.isEmpty()) {
                     expired.forEach(group.members::remove);
+                    listener.onEvent("GROUP_MEMBERS_EXPIRED", Map.of("group", group.groupId, "members", expired));
                     rebalance(group, "session timeout of " + expired);
                 }
             }
@@ -209,6 +226,8 @@ public class GroupCoordinator {
     private void rebalance(Group group, String reason) {
         group.generation++;
         group.target = computeTarget(group);
+        listener.onEvent("GROUP_REBALANCED", Map.of("group", group.groupId, "generation", group.generation,
+                "reason", reason, "members", group.members.size(), "partitions", group.target.size()));
         LOGGER.info("Group " + group.groupId + " generation " + group.generation + " (" + reason + "): " + group.target);
     }
 

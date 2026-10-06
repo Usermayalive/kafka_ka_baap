@@ -79,6 +79,32 @@ public class ConsumerOffsetStore {
         return committed.get(key(group, topic, partition));
     }
 
+    public record CommittedOffset(String group, String topic, int partition, long offset) {}
+
+    /** Every committed offset this broker has loaded (for lag reporting). */
+    public List<CommittedOffset> snapshot() {
+        List<CommittedOffset> result = new java.util.ArrayList<>(committed.size());
+        committed.forEach((key, value) -> {
+            String[] parts = key.split("\u0000", 3);
+            result.add(new CommittedOffset(parts[0], parts[1], Integer.parseInt(parts[2]), value.offset()));
+        });
+        return result;
+    }
+
+    /** Loads every hosted offsets partition so lag reflects groups committed before a restart. */
+    public void loadAllHosted() {
+        for (int p = 0; p < PARTITIONS; p++) {
+            Partition log = localPartition.apply(p);
+            if (log != null) {
+                try {
+                    ensureLoaded(p, log);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to load " + TOPIC + "-" + p, e);
+                }
+            }
+        }
+    }
+
     private Partition hosted(int p) throws IOException {
         Partition log = localPartition.apply(p);
         if (log == null) {

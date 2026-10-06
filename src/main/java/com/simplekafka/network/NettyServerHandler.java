@@ -53,8 +53,11 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         // preventing out-of-order execution of pipelined requests while offloading disk I/O.
         try {
             channelExecutor.execute(() -> {
+                long started = System.nanoTime();
                 try {
                     KafkaFrame response = processFrame(frame);
+                    broker.getMetrics().recordRequest(apiName(frame.getApiKey()), System.nanoTime() - started,
+                            response.getPayload().length >= 2 && (response.getPayload()[0] != 0 || response.getPayload()[1] != 0));
                     ctx.writeAndFlush(response);
                 } catch (Throwable t) {
                     LOGGER.log(Level.SEVERE, "Unexpected error processing frame: " + frame, t);
@@ -98,6 +101,24 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             LOGGER.fine("Connection backlog drained to " + channelExecutor.getQueueDepth() +
                     " requests. Resumed autoRead on channel: " + ctx.channel().id());
         }
+    }
+
+    private static String apiName(short apiKey) {
+        return switch (apiKey) {
+            case KafkaFrame.API_KEY_PRODUCE -> "produce";
+            case KafkaFrame.API_KEY_FETCH -> "fetch";
+            case KafkaFrame.API_KEY_INIT_PRODUCER_ID -> "init_producer_id";
+            case KafkaFrame.API_KEY_METADATA -> "metadata";
+            case KafkaFrame.API_KEY_CREATE_TOPIC -> "create_topic";
+            case KafkaFrame.API_KEY_FIND_COORDINATOR -> "find_coordinator";
+            case KafkaFrame.API_KEY_OFFSET_COMMIT -> "offset_commit";
+            case KafkaFrame.API_KEY_OFFSET_FETCH -> "offset_fetch";
+            case KafkaFrame.API_KEY_JOIN_GROUP -> "join_group";
+            case KafkaFrame.API_KEY_SYNC_GROUP -> "sync_group";
+            case KafkaFrame.API_KEY_HEARTBEAT -> "heartbeat";
+            case KafkaFrame.API_KEY_LEAVE_GROUP -> "leave_group";
+            default -> "unknown"; // bounded: never the raw key
+        };
     }
 
     private KafkaFrame processFrame(KafkaFrame frame) throws Exception {
@@ -181,6 +202,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         }
 
         Partition partition = parts.get(partitionId);
+        broker.getMetrics().recordProduce(topic, message.length);
         if (producerId == KafkaFrame.NO_PRODUCER_ID) {
             return produceResponse(frame, topic, partitionId, partition.append(message), false);
         }
