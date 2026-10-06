@@ -35,6 +35,11 @@ public class MetadataImage {
     private final TreeMap<String, List<SchemaVersion>> schemas = new TreeMap<>();
     private final TreeMap<String, String> schemaCompatibility = new TreeMap<>();
     private int nextSchemaId = 1;
+    /**
+     * Erasure count per hashed entity key (its current key generation). Part of snapshots, so a
+     * broker catching up from one still learns of erasures it never saw as commands.
+     */
+    private final TreeMap<String, Integer> erasures = new TreeMap<>();
 
     /** Applies a command; returns what changed, or throws IllegalStateException if rejected. */
     public synchronized Change apply(MetadataCommand c) {
@@ -103,7 +108,8 @@ public class MetadataImage {
                 return Change.SCHEMAS;
             }
             case FORGET_ENTITY -> {
-                return Change.ENTITY_FORGOTTEN; // keys live outside the image; brokers act on the command
+                erasures.merge(c.entityKey, 1, Integer::sum);
+                return Change.ENTITY_FORGOTTEN;
             }
             case SET_SCHEMA_COMPATIBILITY -> {
                 try {
@@ -159,6 +165,15 @@ public class MetadataImage {
         return null;
     }
 
+    /** How many times the entity has been erased: data encrypted under an older generation is gone. */
+    public synchronized int erasureGeneration(String entityKey) {
+        return erasures.getOrDefault(entityKey, 0);
+    }
+
+    public synchronized Map<String, Integer> erasures() {
+        return new TreeMap<>(erasures);
+    }
+
     public synchronized String schemaCompatibility(String topic) {
         return schemaCompatibility.get(topic);
     }
@@ -198,11 +213,11 @@ public class MetadataImage {
 
     private record Snapshot(List<BrokerRegistration> brokers, List<TopicImage> topics,
                             Map<String, List<SchemaVersion>> schemas, Map<String, String> schemaCompatibility,
-                            int nextSchemaId) {}
+                            int nextSchemaId, Map<String, Integer> erasures) {}
 
     public synchronized String toJson() {
         return GSON.toJson(new Snapshot(new ArrayList<>(brokers.values()), new ArrayList<>(topics.values()),
-                schemas, schemaCompatibility, nextSchemaId));
+                schemas, schemaCompatibility, nextSchemaId, erasures));
     }
 
     public synchronized void loadJson(String json) {
@@ -220,5 +235,9 @@ public class MetadataImage {
             schemaCompatibility.putAll(s.schemaCompatibility());
         }
         nextSchemaId = s.nextSchemaId() == 0 ? 1 : s.nextSchemaId();
+        erasures.clear();
+        if (s.erasures() != null) {
+            erasures.putAll(s.erasures());
+        }
     }
 }

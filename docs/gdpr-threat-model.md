@@ -15,19 +15,31 @@ can stay wherever it is, because nobody can read it any more.
    valid under their schema.
 2. **Produce.** The partition leader validates the record, then encrypts each PII field with
    AES-256-GCM under the entity's DEK (data encryption key). The format is
-   `enc:v1:base64(iv ‖ ciphertext ‖ tag)`, and the additional authenticated data is
-   `entityId/fieldName`, so ciphertext can't be moved to another field or another entity's
-   record. Only ciphertext reaches the log, tiered storage and backups.
-3. **Keys.** One random 256-bit DEK per entity, created on first use and stored *wrapped* by a
-   `MasterKeyProvider` in a RocksDB store on each broker (`<data>/__dek_store`). The wrapped DEK
-   is written with sync.
+   `enc:v1:<generation>:base64(iv ‖ ciphertext ‖ tag)`, and the additional authenticated data is
+   `entityId/field/generation`, so ciphertext can't be moved to another field, entity or key
+   generation. Only ciphertext reaches the log, tiered storage and backups.
+3. **Keys.** One random 256-bit DEK per entity and *key generation*, created on first use and
+   stored *wrapped* by a `MasterKeyProvider` in a RocksDB store on each broker
+   (`<data>/__dek_store`). Keys are named `<sha256(entityId)>-g<generation>`, so the raw entity
+   ID never appears in the key store or KMS. The wrapped DEK is written with sync.
 4. **Fetch.** The leader decrypts PII fields before returning records, so consumers see
    plaintext and need no key access.
-5. **Erasure.** `FORGET_ENTITY` is a Raft metadata command, so **every** broker applies it.
-   Each broker deletes the wrapped DEK, compacts RocksDB, and calls the provider's
-   `onEntityForgotten`. From then on, the entity's PII fields read as `[REDACTED]` on every
-   broker, for every copy of the data. Erasure is audited (`ENTITY_FORGOTTEN`) under a SHA-256 of
-   the entity ID, so the audit trail doesn't re-record the identifier.
+5. **Erasure.** The broker receiving `FORGET_ENTITY` hashes the entity ID and replicates only
+   the hash through Raft. The replicated metadata counts erasures per entity, and the count is
+   the entity's current key generation. Every broker deletes the wrapped DEKs of older
+   generations, compacts RocksDB, and calls the provider's `onEntityForgotten`. From then on the
+   entity's existing PII reads as `[REDACTED]` on every broker, for every copy of the data.
+   Data produced *after* the erasure (for example, the person signs up again) is encrypted under
+   the new generation and stays readable: erasure covers what was held when it was requested.
+   Erasure is audited (`ENTITY_FORGOTTEN`) under the hash only.
+6. **Brokers that missed it.** The erasure counts are part of the metadata image and its
+   snapshots. A broker catching up from a snapshot never sees the individual command, so on
+   startup, and whenever an image is loaded, it reconciles: it destroys every key older than the
+   replicated generation. Completed erasures are marked, so this is cheap to repeat. Decryption
+   also checks the replicated generation directly, so data is redacted even before the local
+   key is destroyed. Finally, a starting broker refuses produce and fetch until its own
+   registration has been applied locally. Registration is appended after every earlier command,
+   so a broker never serves before it has seen every earlier erasure.
 
 ## Master key providers
 
@@ -61,8 +73,7 @@ counts a hierarchical scheme (e.g. per-tenant keys) is the realistic compromise.
 
 - **Key placement follows the broker, not the entity.** Each broker keeps its own DEK for an
   entity, so the same person's records on two brokers use different keys. Erasure still works
-  because `FORGET_ENTITY` is replicated to all brokers. A broker that is down during erasure
-  applies the command from the Raft log when it returns, before serving reads.
+  because the erasure state is replicated to all brokers and reconciled on startup.
 - **Decryption on fetch costs CPU** (an Avro decode, AES-GCM and a re-encode per record on PII
   topics). Topics without PII fields are untouched.
 - **Producers send plaintext PII to the broker.** Client-side encryption would remove the broker

@@ -103,6 +103,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         notifyListeners(MetadataImage.Change.BROKERS);
         notifyListeners(MetadataImage.Change.TOPICS);
         notifyListeners(MetadataImage.Change.SCHEMAS);
+        notifyListeners(MetadataImage.Change.ENTITY_FORGOTTEN); // erasures this node never saw as commands
     }
 
     @Override

@@ -39,7 +39,8 @@ public final class MetadataCommand {
     public List<Integer> isr;
     public String schema;
     public String compatibility;
-    public String entityId;
+    /** SHA-256 hex of the entity ID; the raw ID is never written to the Raft log. */
+    public String entityKey;
 
     private MetadataCommand(Type type) {
         this.type = type;
@@ -100,10 +101,10 @@ public final class MetadataCommand {
         return c;
     }
 
-    /** GDPR erasure: every broker destroys its data key for the entity. */
-    public static MetadataCommand forgetEntity(String entityId) {
+    /** GDPR erasure: every broker destroys its data key for the entity (by its hashed key). */
+    public static MetadataCommand forgetEntity(String entityKey) {
         MetadataCommand c = new MetadataCommand(Type.FORGET_ENTITY);
-        c.entityId = entityId;
+        c.entityKey = entityKey;
         return c;
     }
 

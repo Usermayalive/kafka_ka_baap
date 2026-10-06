@@ -529,7 +529,9 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
         dis.readUTF(); // clientId
         String entityId = dis.readUTF();
-        broker.applyMetadata(com.simplekafka.metadata.MetadataCommand.forgetEntity(entityId));
+        // Only the hash is replicated and persisted; the raw identifier stops here
+        broker.applyMetadata(com.simplekafka.metadata.MetadataCommand.forgetEntity(
+                com.simplekafka.gdpr.CryptoShredder.entityKey(entityId)));
         return okFrame(frame, out -> {});
     }
 
@@ -547,6 +549,10 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
     }
 
     private KafkaFrame rejectIfNotLeader(KafkaFrame frame, String topic, int partitionId, Partition partition) {
+        if (!broker.isServingReady()) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_LEADER_NOT_AVAILABLE,
+                    "Broker " + broker.getBrokerId() + " is still catching up on cluster metadata");
+        }
         if (partition == null) {
             boolean known = broker.partitionCount(topic) > partitionId;
             return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),

@@ -31,6 +31,17 @@ public class DekStore implements AutoCloseable {
         }
     }
 
+    private static final String FORGOTTEN_PREFIX = "forgotten:";
+
+    /** Marks an entity's erasure as fully applied (key deleted and provider notified). */
+    public void markForgotten(String entityKey) throws IOException {
+        put(FORGOTTEN_PREFIX + entityKey, new byte[]{1});
+    }
+
+    public boolean isMarkedForgotten(String entityKey) throws IOException {
+        return get(FORGOTTEN_PREFIX + entityKey) != null;
+    }
+
     public byte[] get(String entityId) throws IOException {
         try {
             return db.get(key(entityId));

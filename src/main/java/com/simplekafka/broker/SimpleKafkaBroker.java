@@ -71,6 +71,12 @@ public class SimpleKafkaBroker {
     private volatile AdminHttpServer adminServer;
     private volatile int adminPort = -1;
     private volatile ClientQuotaManager quotaManager = new ClientQuotaManager();
+    /**
+     * False from start() until this broker's registration is applied locally. Registration is
+     * appended after every earlier metadata command, so once it's visible this broker has seen
+     * every earlier erasure, leadership change and schema before serving produce or fetch.
+     */
+    private volatile boolean servingReady = true;
     // Used when running without a metadata quorum (standalone/tests); the quorum's image otherwise
     private final MetadataImage localImage = new MetadataImage();
     private final SchemaService schemaService = new SchemaService(this::metadataImage);
@@ -106,6 +112,7 @@ public class SimpleKafkaBroker {
 
     public void start() throws Exception {
         isRunning.set(true);
+        servingReady = false;
         LOGGER.info("Starting broker " + brokerId + " on " + brokerHost + ":" + brokerPort);
 
         nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, quotaManager,
@@ -129,6 +136,8 @@ public class SimpleKafkaBroker {
         zkClient.quorum().stateMachine().onChange(change -> {
             if (change == MetadataImage.Change.SCHEMAS) {
                 schemaService.invalidate(); // local schema cache follows the replicated registry
+            } else if (change == MetadataImage.Change.ENTITY_FORGOTTEN) {
+                reconcileForgottenEntities(); // covers erasures learned from a snapshot, not a command
             }
         });
         registerWithZookeeper();
@@ -168,7 +177,9 @@ public class SimpleKafkaBroker {
             // Ensure parent directories exist
             zkClient.createPath("/brokers");
             zkClient.createPath("/brokers/ids");
-            zkClient.createEphemeralNode(path, gson.toJson(brokerData));
+            zkClient.createEphemeralNode(path, gson.toJson(brokerData)); // returns once applied locally
+            reconcileForgottenEntities();
+            servingReady = true;
             
             // Watch for cluster changes
             zkClient.watchChildren("/brokers/ids", this::onBrokersChanged);
@@ -491,13 +502,13 @@ public class SimpleKafkaBroker {
                 CryptoShredder shredder = schemaService.shredder();
                 try {
                     if (shredder != null) {
-                        shredder.forget(command.entityId);
+                        shredder.forget(command.entityKey, metadataImage().erasureGeneration(command.entityKey));
                     }
-                    // Audit the erasure without re-recording the personal identifier
-                    audit().record("ENTITY_FORGOTTEN", Map.of("entitySha256", sha256(command.entityId),
+                    // The command only carries the hash, so the audit trail can't re-record the identifier
+                    audit().record("ENTITY_FORGOTTEN", Map.of("entitySha256", command.entityKey,
                             "keyDestroyed", shredder != null));
                 } catch (IOException e) {
-                    LOGGER.log(Level.SEVERE, "Failed to destroy key for forgotten entity", e);
+                    LOGGER.log(Level.SEVERE, "Failed to destroy key for forgotten entity (retried on restart)", e);
                 }
             }
             case REGISTER_SCHEMA -> audit().record("SCHEMA_REGISTERED", Map.of("topic", command.topic));
@@ -508,13 +519,28 @@ public class SimpleKafkaBroker {
         }
     }
 
-    private static String sha256(String value) {
-        try {
-            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        } catch (java.security.NoSuchAlgorithmException e) {
-            throw new IllegalStateException(e);
+    /**
+     * Destroys local keys for every entity erased cluster-wide. Idempotent; completed erasures
+     * are skipped cheaply. Covers commands missed while down and erasures that arrived in a
+     * snapshot rather than as individual commands.
+     */
+    public void reconcileForgottenEntities() {
+        CryptoShredder shredder = schemaService.shredder();
+        if (shredder == null) {
+            return;
         }
+        for (Map.Entry<String, Integer> erasure : metadataImage().erasures().entrySet()) {
+            String entityKey = erasure.getKey();
+            try {
+                shredder.forget(entityKey, erasure.getValue());
+            } catch (IOException e) {
+                LOGGER.log(Level.SEVERE, "Failed to destroy key for forgotten entity " + entityKey, e);
+            }
+        }
+    }
+
+    public boolean isServingReady() {
+        return servingReady;
     }
 
     public SchemaService getSchemaService() {
@@ -523,7 +549,9 @@ public class SimpleKafkaBroker {
 
     /** Enables PII field encryption with wrapped per-entity keys in this broker's local key store. */
     public void enableCryptoShredding(MasterKeyProvider masterKeys) throws IOException {
-        schemaService.setShredder(new CryptoShredder(new DekStore(new File(dataDir(), "__dek_store")), masterKeys));
+        schemaService.setShredder(new CryptoShredder(new DekStore(new File(dataDir(), "__dek_store")), masterKeys,
+                entityKey -> metadataImage().erasureGeneration(entityKey)));
+        reconcileForgottenEntities();
     }
 
     /**

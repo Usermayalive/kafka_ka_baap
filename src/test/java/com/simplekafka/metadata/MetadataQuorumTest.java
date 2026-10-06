@@ -135,6 +135,15 @@ public class MetadataQuorumTest {
     }
 
     @Test
+    void testSnapshotPreservesForgottenEntities() {
+        MetadataImage image = new MetadataImage();
+        image.apply(MetadataCommand.forgetEntity("abc123"));
+        MetadataImage restored = new MetadataImage();
+        restored.loadJson(image.toJson());
+        assertEquals(1, restored.erasureGeneration("abc123"));
+    }
+
+    @Test
     void testLearnerCatchesUpAndEvenQuorumPromotionIsRefused() throws Exception {
         List<MetadataQuorum.Peer> voters = peers(3);
         List<MetadataQuorum> nodes = startAll(voters, 1_000);

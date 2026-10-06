@@ -252,6 +252,50 @@ public class SchemaAndGdprTest {
     }
 
     @Test
+    void testErasureLearnedFromSnapshotOnlyIsEnforcedAndReconciled() throws Exception {
+        byte[] masterKey = new byte[32];
+        new SecureRandom().nextBytes(masterKey);
+        broker.enableCryptoShredding(new EnvMasterKeyProvider(masterKey));
+        int id = client.registerSchema("users", USER_PII);
+        client.send("users", 0, user(id, "u-777", "carol@example.com", null));
+
+        // The image learns of the erasure without the FORGET_ENTITY command being delivered to
+        // this broker's listeners: what happens when it catches up from a Raft snapshot
+        String key = CryptoShredder.entityKey("u-777");
+        broker.metadataImage().apply(com.simplekafka.metadata.MetadataCommand.forgetEntity(key));
+        assertEquals(CryptoShredder.REDACTED, fetchUsers().get(0).get("email").toString(),
+                "Replicated erasure state is enforced on decrypt even before the local key is destroyed");
+
+        broker.reconcileForgottenEntities();
+        broker.getSchemaService().shredder().close();
+
+        // A fresh broker on the same data whose image does NOT know about the erasure:
+        // only the destroyed key keeps the data unreadable
+        SimpleKafkaBroker fresh = new SimpleKafkaBroker(1, "127.0.0.1", 0, 0) {
+            @Override public void start() {}
+            @Override public void stop() {}
+            @Override protected String dataDir() {
+                return tempDir.getAbsolutePath();
+            }
+        };
+        fresh.enableCryptoShredding(new EnvMasterKeyProvider(masterKey));
+        fresh.applyMetadata(com.simplekafka.metadata.MetadataCommand.registerSchema("users", USER_PII));
+        byte[] stored = broker.hostedPartition("users", 0).readRecords(0, 1 << 20).get(0).payload();
+        GenericRecord viaFreshBroker = serde.deserialize(fresh.getSchemaService().onFetch("users", stored));
+        assertEquals(CryptoShredder.REDACTED, viaFreshBroker.get("email").toString(), "Reconciliation destroyed the key");
+        fresh.getSchemaService().shredder().close();
+        broker.getSchemaService().setShredder(null);
+    }
+
+    @Test
+    void testOnlyTheHashOfTheEntityIdIsReplicated() throws Exception {
+        registerUsersWithShredding();
+        client.forgetEntity("u-123");
+        assertEquals(java.util.Map.of(CryptoShredder.entityKey("u-123"), 1), broker.metadataImage().erasures());
+        assertFalse(broker.metadataImage().toJson().contains("u-123"), "Snapshots must not contain the raw entity ID");
+    }
+
+    @Test
     void testPiiSchemaRulesAndMissingKeyProvider() throws Exception {
         String noEntity = USER_PII.replace("\"pii.entity\":\"userId\",", "");
         BrokerErrorException invalid = assertThrows(BrokerErrorException.class, () -> client.registerSchema("users", noEntity));

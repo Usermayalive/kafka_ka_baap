@@ -30,25 +30,25 @@ public class EnvMasterKeyProvider implements MasterKeyProvider {
     }
 
     @Override
-    public byte[] wrap(String entityId, byte[] dek) throws IOException {
+    public byte[] wrap(String entityKey, byte[] dek) throws IOException {
         try {
-            return AesGcm.encrypt(masterKey, dek, "dek:" + entityId);
+            return AesGcm.encrypt(masterKey, dek, "dek:" + entityKey);
         } catch (GeneralSecurityException e) {
             throw new IOException("Failed to wrap DEK", e);
         }
     }
 
     @Override
-    public byte[] unwrap(String entityId, byte[] wrappedDek) throws IOException {
+    public byte[] unwrap(String entityKey, byte[] wrappedDek) throws IOException {
         try {
-            return AesGcm.decrypt(masterKey, wrappedDek, "dek:" + entityId);
+            return AesGcm.decrypt(masterKey, wrappedDek, "dek:" + entityKey);
         } catch (GeneralSecurityException e) {
             throw new IOException("Failed to unwrap DEK for entity (wrong master key or tampered store)", e);
         }
     }
 
     @Override
-    public void onEntityForgotten(String entityId) {
+    public void onEntityForgotten(String entityKey) {
         // Nothing to destroy: the shared master key protects all other entities
     }
 }

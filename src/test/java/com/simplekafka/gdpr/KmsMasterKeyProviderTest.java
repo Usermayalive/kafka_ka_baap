@@ -92,10 +92,11 @@ public class KmsMasterKeyProviderTest {
             assertFalse(kms.aliases.keySet().stream().anyMatch(a -> a.contains("alice")),
                     "Aliases must not contain the entity ID");
 
-            shredder.forget("alice");
+            shredder.forget(CryptoShredder.entityKey("alice"), 1);
 
             assertEquals(1, kms.deletions.size());
             assertEquals(KmsMasterKeyProvider.PENDING_DELETION_DAYS, kms.deletions.get(0).pendingWindowInDays());
+            // This shredder has no replicated erasure state (generation stays 0): only key destruction redacts
             assertEquals(CryptoShredder.REDACTED, shredder.decrypt("alice", "email", alice));
             assertEquals("bob@example.com", shredder.decrypt("bob", "email", bob));
         }
