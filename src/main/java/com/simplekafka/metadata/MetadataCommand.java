@@ -20,7 +20,8 @@ public final class MetadataCommand {
         UPDATE_ISR,
         ELECT_LEADER,
         REGISTER_SCHEMA,
-        SET_SCHEMA_COMPATIBILITY
+        SET_SCHEMA_COMPATIBILITY,
+        FORGET_ENTITY
     }
 
     private static final Gson GSON = new Gson();
@@ -38,6 +39,7 @@ public final class MetadataCommand {
     public List<Integer> isr;
     public String schema;
     public String compatibility;
+    public String entityId;
 
     private MetadataCommand(Type type) {
         this.type = type;
@@ -95,6 +97,13 @@ public final class MetadataCommand {
         MetadataCommand c = new MetadataCommand(Type.SET_SCHEMA_COMPATIBILITY);
         c.topic = topic;
         c.compatibility = compatibility;
+        return c;
+    }
+
+    /** GDPR erasure: every broker destroys its data key for the entity. */
+    public static MetadataCommand forgetEntity(String entityId) {
+        MetadataCommand c = new MetadataCommand(Type.FORGET_ENTITY);
+        c.entityId = entityId;
         return c;
     }
 

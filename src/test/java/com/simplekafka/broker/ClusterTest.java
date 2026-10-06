@@ -84,14 +84,46 @@ public class ClusterTest {
         return t == null ? Integer.MIN_VALUE : t.partitions().get(partition).leader();
     }
 
-    @Test
-    void testClusterSurvivesBrokerCrashAndRecoversItsPartitions() throws Exception {
+    private void startThreeBrokerCluster() throws Exception {
         voters = List.of(new MetadataQuorum.Peer(1, "127.0.0.1", freePort()),
                 new MetadataQuorum.Peer(2, "127.0.0.1", freePort()),
                 new MetadataQuorum.Peer(3, "127.0.0.1", freePort()));
         startAll(List.of(newBroker(1), newBroker(2), newBroker(3)));
         await("controller elected", 15_000, () -> controller() != null);
         await("all brokers registered", 10_000, () -> controller().liveBrokers().size() == 3);
+    }
+
+    @Test
+    void testSchemaRegisteredOnOneBrokerIsEnforcedByAllViaRaft() throws Exception {
+        startThreeBrokerCluster();
+        String schema = "{\"type\":\"record\",\"name\":\"Evt\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"}]}";
+        try (SimpleKafkaClient client = new SimpleKafkaClient("127.0.0.1", brokers.get(1).getPort())) {
+            client.initialize();
+            client.createTopic("events", 3, (short) 1);
+            await("events visible everywhere", 10_000, () -> brokers.values().stream()
+                    .allMatch(b -> b.hostedPartition("events", 0) != null || b.getMetadataLog().image().topicImage("events") != null));
+            int id = client.registerSchema("events", schema); // committed via Raft from broker 1
+            await("schema replicated", 10_000, () -> brokers.values().stream()
+                    .allMatch(b -> b.metadataImage().schemaById(id) != null));
+
+            org.apache.avro.Schema avro = new org.apache.avro.Schema.Parser().parse(schema);
+            org.apache.avro.generic.GenericRecord rec = new org.apache.avro.generic.GenericData.Record(avro);
+            rec.put("n", 7);
+            for (int p = 0; p < 3; p++) { // partitions are led by brokers 1, 2 and 3
+                client.send("events", p, com.simplekafka.schema.AvroSerde.serialize(id, avro, rec));
+                final int partition = p;
+                com.simplekafka.client.BrokerErrorException rejected = assertThrows(
+                        com.simplekafka.client.BrokerErrorException.class,
+                        () -> client.send("events", partition, "not avro".getBytes(StandardCharsets.UTF_8)));
+                assertEquals(com.simplekafka.network.KafkaFrame.ERROR_SCHEMA_VIOLATION, rejected.getErrorCode(),
+                        "Every partition leader enforces the replicated schema");
+            }
+        }
+    }
+
+    @Test
+    void testClusterSurvivesBrokerCrashAndRecoversItsPartitions() throws Exception {
+        startThreeBrokerCluster();
 
         SimpleKafkaBroker bootstrap = brokers.get(1);
         try (SimpleKafkaClient client = new SimpleKafkaClient("127.0.0.1", bootstrap.getPort())) {

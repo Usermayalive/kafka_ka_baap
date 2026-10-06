@@ -44,6 +44,7 @@ public class MetadataStateMachine extends BaseStateMachine {
     private final SimpleStateMachineStorage storage = new SimpleStateMachineStorage();
     private final List<Consumer<MetadataImage.Change>> changeListeners = new CopyOnWriteArrayList<>();
     private final List<Consumer<RaftPeerId>> leaderListeners = new CopyOnWriteArrayList<>();
+    private final List<Consumer<MetadataCommand>> commandListeners = new CopyOnWriteArrayList<>();
     /** Leader-local: broker id -> last heartbeat (nanoTime). */
     private final Map<Integer, Long> lastHeartbeat = new ConcurrentHashMap<>();
     // Listeners run off the apply thread, in commit order
@@ -59,6 +60,11 @@ public class MetadataStateMachine extends BaseStateMachine {
 
     public void onChange(Consumer<MetadataImage.Change> listener) {
         changeListeners.add(listener);
+    }
+
+    /** Called (off the apply thread, in commit order) with every successfully applied command. */
+    public void onCommand(Consumer<MetadataCommand> listener) {
+        commandListeners.add(listener);
     }
 
     public void onLeaderChange(Consumer<RaftPeerId> listener) {
@@ -118,8 +124,10 @@ public class MetadataStateMachine extends BaseStateMachine {
         String reply;
         MetadataImage.Change change = MetadataImage.Change.NONE;
         try {
-            change = image.apply(MetadataCommand.fromBytes(data));
+            MetadataCommand command = MetadataCommand.fromBytes(data);
+            change = image.apply(command);
             reply = "OK";
+            notifier.execute(() -> commandListeners.forEach(l -> safely(() -> l.accept(command))));
         } catch (IllegalStateException e) {
             reply = "ERR " + e.getMessage(); // deterministic rejection, identical on every node
         } catch (RuntimeException e) {

@@ -211,6 +211,44 @@ public class SimpleKafkaClient implements AutoCloseable {
         }
     }
 
+    /** Registers (or finds) a schema for the topic; returns its registry ID. Fails if incompatible. */
+    public int registerSchema(String topic, String schemaJson) throws IOException {
+        byte[] schemaBytes = schemaJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        return connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_REGISTER_SCHEMA, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeUTF(topic);
+            o.writeInt(schemaBytes.length);
+            o.write(schemaBytes);
+        })).readInt();
+    }
+
+    /** NONE, BACKWARD (default), FORWARD or FULL. */
+    public void setSchemaCompatibility(String topic, String mode) throws IOException {
+        connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_SET_SCHEMA_COMPATIBILITY, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeUTF(topic);
+            o.writeUTF(mode);
+        }));
+    }
+
+    public String getSchema(int schemaId) throws IOException {
+        DataInputStream in = connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_GET_SCHEMA, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeInt(schemaId);
+        }));
+        byte[] bytes = new byte[in.readInt()];
+        in.readFully(bytes);
+        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** GDPR erasure: every broker destroys the entity's data key; its PII fields read as [REDACTED]. */
+    public void forgetEntity(String entityId) throws IOException {
+        connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_FORGET_ENTITY, payload(o -> {
+            o.writeUTF(clientId);
+            o.writeUTF(entityId);
+        }));
+    }
+
     /** Assigns consecutive offsets starting at {@code startOffset}; for tests and simple mocks. */
     public static List<FetchedRecord> contiguous(long startOffset, List<byte[]> payloads) {
         List<FetchedRecord> records = new ArrayList<>(payloads.size());

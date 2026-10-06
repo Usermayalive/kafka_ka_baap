@@ -28,6 +28,10 @@ public class KafkaFrame {
     public static final short API_KEY_SYNC_GROUP = 10;
     public static final short API_KEY_HEARTBEAT = 11;
     public static final short API_KEY_LEAVE_GROUP = 12;
+    public static final short API_KEY_REGISTER_SCHEMA = 13;
+    public static final short API_KEY_SET_SCHEMA_COMPATIBILITY = 14;
+    public static final short API_KEY_GET_SCHEMA = 15;
+    public static final short API_KEY_FORGET_ENTITY = 16;
 
     // Error Codes
     public static final short ERROR_NONE = 0;
@@ -45,6 +49,9 @@ public class KafkaFrame {
     public static final short ERROR_UNKNOWN_MEMBER = 1011;
     public static final short ERROR_NOT_LEADER = 1012;
     public static final short ERROR_LEADER_NOT_AVAILABLE = 1013;
+    public static final short ERROR_SCHEMA_VIOLATION = 1014;
+    public static final short ERROR_INCOMPATIBLE_SCHEMA = 1015;
+    public static final short ERROR_SCHEMA_NOT_FOUND = 1016;
 
     /** Produce with this producer ID to bypass idempotence (Kafka's NO_PRODUCER_ID). */
     public static final long NO_PRODUCER_ID = -1L;

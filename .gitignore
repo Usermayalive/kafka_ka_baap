@@ -4,3 +4,4 @@ kafka-data/
 .idea/
 *.class
 .DS_Store
+target-cli/

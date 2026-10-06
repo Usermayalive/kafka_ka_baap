@@ -161,6 +161,26 @@ public class MetadataQuorum implements AutoCloseable {
         if (result.startsWith("ERR ")) {
             throw new IllegalStateException(result.substring(4));
         }
+        awaitLocallyApplied(reply.getLogIndex());
+    }
+
+    /**
+     * Read-your-writes on this node: the reply comes back once the leader commits, but if this
+     * node is a follower its own image may not include the entry yet.
+     */
+    private void awaitLocallyApplied(long logIndex) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (stateMachine.getLastAppliedTermIndex().getIndex() < logIndex) {
+            if (System.nanoTime() > deadline) {
+                throw new IOException("Committed metadata entry " + logIndex + " not applied locally within 10s");
+            }
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted waiting for metadata entry " + logIndex, e);
+            }
+        }
     }
 
     /**

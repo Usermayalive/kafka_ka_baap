@@ -14,6 +14,8 @@
         <junit.version>5.10.2</junit.version>
         <awssdk.version>2.55.11</awssdk.version>
         <netty.version>4.1.138.Final</netty.version>
+        <!-- Override (-Dbuild.dir=target-cli) to keep CLI builds apart from an IDE compiling into target/ -->
+        <build.dir>${project.basedir}/target</build.dir>
     </properties>
 
     <dependencyManagement>
@@ -102,6 +104,22 @@
             <version>1.17.1</version>
         </dependency>
 
+        <!-- Phase 6: schema validation (Avro) and crypto-shredding key store (RocksDB, AWS KMS) -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>1.12.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.rocksdb</groupId>
+            <artifactId>rocksdbjni</artifactId>
+            <version>11.1.1</version>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kms</artifactId>
+        </dependency>
+
         <!-- Logging: SLF4J 2 + Logback (library logs: Ratis, gRPC, Netty, AWS SDK) -->
         <dependency>
             <groupId>org.slf4j</groupId>
@@ -124,6 +142,7 @@
     </dependencies>
 
     <build>
+        <directory>${build.dir}</directory>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

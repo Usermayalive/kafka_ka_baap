@@ -117,6 +117,10 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             case KafkaFrame.API_KEY_SYNC_GROUP -> "sync_group";
             case KafkaFrame.API_KEY_HEARTBEAT -> "heartbeat";
             case KafkaFrame.API_KEY_LEAVE_GROUP -> "leave_group";
+            case KafkaFrame.API_KEY_REGISTER_SCHEMA -> "register_schema";
+            case KafkaFrame.API_KEY_SET_SCHEMA_COMPATIBILITY -> "set_schema_compatibility";
+            case KafkaFrame.API_KEY_GET_SCHEMA -> "get_schema";
+            case KafkaFrame.API_KEY_FORGET_ENTITY -> "forget_entity";
             default -> "unknown"; // bounded: never the raw key
         };
     }
@@ -144,6 +148,14 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             case KafkaFrame.API_KEY_HEARTBEAT:
             case KafkaFrame.API_KEY_LEAVE_GROUP:
                 return handleGroupRequest(frame);
+            case KafkaFrame.API_KEY_REGISTER_SCHEMA:
+                return handleRegisterSchema(frame);
+            case KafkaFrame.API_KEY_SET_SCHEMA_COMPATIBILITY:
+                return handleSetCompatibility(frame);
+            case KafkaFrame.API_KEY_GET_SCHEMA:
+                return handleGetSchema(frame);
+            case KafkaFrame.API_KEY_FORGET_ENTITY:
+                return handleForgetEntity(frame);
             default:
                 return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                         KafkaFrame.ERROR_CORRUPT_MESSAGE, "Unknown apiKey: " + frame.getApiKey());
@@ -196,9 +208,17 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         if (notLeader != null) {
             return notLeader;
         }
-        broker.getMetrics().recordProduce(topic, message.length);
+        // 3. Schema enforcement and PII encryption (topics with a registered schema only)
+        final byte[] stored;
+        try {
+            stored = broker.getSchemaService().onProduce(topic, message);
+        } catch (com.simplekafka.schema.SchemaViolationException sve) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_SCHEMA_VIOLATION,
+                    sve.getMessage());
+        }
+        broker.getMetrics().recordProduce(topic, stored.length);
         if (producerId == KafkaFrame.NO_PRODUCER_ID) {
-            return produceResponse(frame, topic, partitionId, partition.append(message), false);
+            return produceResponse(frame, topic, partitionId, partition.append(stored), false);
         }
         idempotenceManager.registerPartitionDir(topic, partitionId, new File(partition.getBaseDir()));
 
@@ -208,7 +228,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             // happens after it is released so concurrent producers share one group commit. A
             // duplicate also waits: its original may still be awaiting the same flush.
             IdempotenceManager.IdempotentResult result = idempotenceManager.verifyAndApply(
-                    topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.appendBuffered(message)
+                    topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.appendBuffered(stored)
             );
             partition.awaitDurable(result.offset());
 
@@ -250,9 +270,10 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         dos.writeShort(KafkaFrame.ERROR_NONE);
         dos.writeInt(records.size());
         for (Partition.Record r : records) {
+            byte[] payload = broker.getSchemaService().onFetch(topic, r.payload());
             dos.writeLong(r.offset());
-            dos.writeInt(r.payload().length);
-            dos.write(r.payload());
+            dos.writeInt(payload.length);
+            dos.write(payload);
         }
         dos.writeLong(partition.getNextOffset());
         dos.flush();
@@ -449,6 +470,82 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
      * retry on NOT_LEADER / LEADER_NOT_AVAILABLE. A leader of 0 means "unassigned" (standalone
      * brokers without cluster metadata) and is served locally.
      */
+    /** Request: [clientId][topic][schemaJson]. Response: [error][schemaId:4][version:4]. */
+    private KafkaFrame handleRegisterSchema(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String topic = dis.readUTF();
+        String schemaJson = readLongString(dis);
+        org.apache.avro.Schema parsed;
+        try {
+            parsed = new org.apache.avro.Schema.Parser().parse(schemaJson);
+            broker.applyMetadata(com.simplekafka.metadata.MetadataCommand.registerSchema(topic, schemaJson));
+        } catch (IllegalStateException | org.apache.avro.SchemaParseException e) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_INCOMPATIBLE_SCHEMA,
+                    e.getMessage());
+        }
+        for (var v : broker.metadataImage().schemas(topic)) {
+            if (new org.apache.avro.Schema.Parser().parse(v.schema()).equals(parsed)) {
+                return okFrame(frame, out -> {
+                    out.writeInt(v.id());
+                    out.writeInt(v.version());
+                });
+            }
+        }
+        return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_SERVER_ERROR,
+                "Schema committed but not yet visible on this broker; retry");
+    }
+
+    /** Request: [clientId][topic][NONE|BACKWARD|FORWARD|FULL]. Response: [error]. */
+    private KafkaFrame handleSetCompatibility(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String topic = dis.readUTF();
+        String mode = dis.readUTF();
+        try {
+            broker.applyMetadata(com.simplekafka.metadata.MetadataCommand.setSchemaCompatibility(topic, mode));
+        } catch (IllegalStateException e) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_INCOMPATIBLE_SCHEMA,
+                    e.getMessage());
+        }
+        return okFrame(frame, out -> {});
+    }
+
+    /** Request: [clientId][schemaId:4]. Response: [error][schemaJson]. */
+    private KafkaFrame handleGetSchema(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        int id = dis.readInt();
+        var schema = broker.metadataImage().schemaById(id);
+        if (schema == null) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_SCHEMA_NOT_FOUND,
+                    "No schema with id " + id);
+        }
+        return okFrame(frame, out -> writeLongString(out, schema.schema()));
+    }
+
+    /** Request: [clientId][entityId]. Response: [error]. Replicated: every broker destroys its key. */
+    private KafkaFrame handleForgetEntity(KafkaFrame frame) throws IOException {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        dis.readUTF(); // clientId
+        String entityId = dis.readUTF();
+        broker.applyMetadata(com.simplekafka.metadata.MetadataCommand.forgetEntity(entityId));
+        return okFrame(frame, out -> {});
+    }
+
+    /** Schemas can exceed writeUTF's 64KB limit: [len:4][utf8 bytes]. */
+    private static String readLongString(DataInputStream in) throws IOException {
+        byte[] bytes = new byte[in.readInt()];
+        in.readFully(bytes);
+        return new String(bytes, StandardCharsets.UTF_8);
+    }
+
+    private static void writeLongString(DataOutputStream out, String value) throws IOException {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        out.writeInt(bytes.length);
+        out.write(bytes);
+    }
+
     private KafkaFrame rejectIfNotLeader(KafkaFrame frame, String topic, int partitionId, Partition partition) {
         if (partition == null) {
             boolean known = broker.partitionCount(topic) > partitionId;

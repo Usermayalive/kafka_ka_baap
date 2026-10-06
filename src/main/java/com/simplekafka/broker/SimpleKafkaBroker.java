@@ -4,7 +4,15 @@ package com.simplekafka.broker;
 import com.google.gson.Gson;
 import com.simplekafka.coordinator.ConsumerOffsetStore;
 import com.simplekafka.coordinator.GroupCoordinator;
+import com.simplekafka.gdpr.CryptoShredder;
+import com.simplekafka.gdpr.DekStore;
+import com.simplekafka.gdpr.EnvMasterKeyProvider;
+import com.simplekafka.gdpr.KmsMasterKeyProvider;
+import com.simplekafka.gdpr.MasterKeyProvider;
+import com.simplekafka.metadata.MetadataCommand;
+import com.simplekafka.metadata.MetadataImage;
 import com.simplekafka.metadata.MetadataLog;
+import com.simplekafka.schema.SchemaService;
 import com.simplekafka.metadata.MetadataQuorum;
 import com.simplekafka.network.ClientQuotaManager;
 import com.simplekafka.observability.AdminHttpServer;
@@ -62,6 +70,9 @@ public class SimpleKafkaBroker {
     private volatile AuditLog auditLog;
     private volatile AdminHttpServer adminServer;
     private volatile int adminPort = -1;
+    // Used when running without a metadata quorum (standalone/tests); the quorum's image otherwise
+    private final MetadataImage localImage = new MetadataImage();
+    private final SchemaService schemaService = new SchemaService(this::metadataImage);
 
     /**
      * @param raftPort port of this broker's metadata quorum member. Standalone by default; call
@@ -113,6 +124,12 @@ public class SimpleKafkaBroker {
                 new File(dataDir(), "__metadata"), MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS));
         zkClient.connect();
         zkClient.onPartitionStateChange(this::reloadAllTopics);
+        zkClient.quorum().stateMachine().onCommand(this::onMetadataCommand);
+        zkClient.quorum().stateMachine().onChange(change -> {
+            if (change == MetadataImage.Change.SCHEMAS) {
+                schemaService.invalidate(); // local schema cache follows the replicated registry
+            }
+        });
         registerWithZookeeper();
         electController();
         loadExistingTopics();
@@ -441,6 +458,63 @@ public class SimpleKafkaBroker {
         return zkClient;
     }
 
+    public MetadataImage metadataImage() {
+        return zkClient != null ? zkClient.image() : localImage;
+    }
+
+    /** Replicates a metadata command through the quorum (or applies it locally when standalone). */
+    public void applyMetadata(MetadataCommand command) throws IOException {
+        if (zkClient != null) {
+            zkClient.quorum().submit(command);
+            return;
+        }
+        localImage.apply(command); // throws IllegalStateException on rejection, like the quorum
+        schemaService.invalidate();
+        onMetadataCommand(command);
+    }
+
+    /** Every broker reacts to committed commands that touch broker-local state. */
+    private void onMetadataCommand(MetadataCommand command) {
+        switch (command.type) {
+            case FORGET_ENTITY -> {
+                CryptoShredder shredder = schemaService.shredder();
+                try {
+                    if (shredder != null) {
+                        shredder.forget(command.entityId);
+                    }
+                    // Audit the erasure without re-recording the personal identifier
+                    audit().record("ENTITY_FORGOTTEN", Map.of("entitySha256", sha256(command.entityId),
+                            "keyDestroyed", shredder != null));
+                } catch (IOException e) {
+                    LOGGER.log(Level.SEVERE, "Failed to destroy key for forgotten entity", e);
+                }
+            }
+            case REGISTER_SCHEMA -> audit().record("SCHEMA_REGISTERED", Map.of("topic", command.topic));
+            case SET_SCHEMA_COMPATIBILITY -> audit().record("SCHEMA_COMPATIBILITY_SET",
+                    Map.of("topic", command.topic, "mode", command.compatibility));
+            default -> {
+            }
+        }
+    }
+
+    private static String sha256(String value) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public SchemaService getSchemaService() {
+        return schemaService;
+    }
+
+    /** Enables PII field encryption with wrapped per-entity keys in this broker's local key store. */
+    public void enableCryptoShredding(MasterKeyProvider masterKeys) throws IOException {
+        schemaService.setShredder(new CryptoShredder(new DekStore(new File(dataDir(), "__dek_store")), masterKeys));
+    }
+
     /**
      * GET  /admin/quorum                              leader, voters, learners
      * POST /admin/quorum/learners?id=&host=&port=     add a non-voting learner (call on the leader)
@@ -735,6 +809,14 @@ public class SimpleKafkaBroker {
         }
         if (args.length >= 5) {
             broker.setDurabilityMode(DurabilityMode.valueOf(args[4]));
+        }
+        if (System.getenv("STORMLOG_KMS_REGION") != null) {
+            broker.enableCryptoShredding(new KmsMasterKeyProvider(
+                    software.amazon.awssdk.services.kms.KmsClient.builder()
+                            .region(software.amazon.awssdk.regions.Region.of(System.getenv("STORMLOG_KMS_REGION"))).build(),
+                    System.getenv().getOrDefault("STORMLOG_KMS_ALIAS_PREFIX", "stormlog")));
+        } else if (System.getenv(EnvMasterKeyProvider.ENV_VAR) != null) {
+            broker.enableCryptoShredding(EnvMasterKeyProvider.fromEnvironment());
         }
         String s3Endpoint = System.getenv("STORMLOG_S3_ENDPOINT");
         if (s3Endpoint != null && !s3Endpoint.isBlank()) {
