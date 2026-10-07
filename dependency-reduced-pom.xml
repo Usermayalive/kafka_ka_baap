@@ -22,6 +22,8 @@
           <argLine>--enable-native-access=ALL-UNNAMED</argLine>
           <systemPropertyVariables>
             <stormlog.data.dir>${project.build.directory}/test-kafka-data</stormlog.data.dir>
+            <stormlog.replica.lag.max.ms>2000</stormlog.replica.lag.max.ms>
+            <stormlog.session.timeout.ms>3000</stormlog.session.timeout.ms>
           </systemPropertyVariables>
         </configuration>
       </plugin>
