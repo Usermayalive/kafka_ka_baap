@@ -109,9 +109,11 @@ def main(csv_path, out_path):
 
     ax = axes[0][2]
     style(ax, f"p99 latency at {rate:,} records/s (no batching)", "ms (log)", log_y=True)
-    ax.yaxis.set_major_locator(FixedLocator([0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]))
+    p99_max = max(float(r["p99_ms"]) for (_, mode), data in rows.items() if mode == fixed for r in data.values())
+    ax.yaxis.set_major_locator(FixedLocator([v for v in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+                                             if v <= p99_max * 2]))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-    ax.set_ylim(0.1, 50)
+    ax.set_ylim(0.1, p99_max * 1.6)  # fit the data: tails vary run to run
     series(ax, rows, fixed, lambda r, s: max(float(r["p99_ms"]), 0.01))
 
     ax = axes[1][0]

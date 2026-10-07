@@ -65,21 +65,6 @@
             <version>1.5.7-21</version>
         </dependency>
 
-        <!-- Tiered storage: async S3 client (MinIO-compatible) and Zstd segment compression -->
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>s3</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>netty-nio-client</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.github.luben</groupId>
-            <artifactId>zstd-jni</artifactId>
-            <version>1.5.7-21</version>
-        </dependency>
-
         <!-- Embedded Raft metadata quorum (replaces ZooKeeper) -->
         <dependency>
             <groupId>org.apache.ratis</groupId>
@@ -163,6 +148,8 @@
                         <stormlog.data.dir>${project.build.directory}/test-kafka-data</stormlog.data.dir>
                         <!-- Faster ISR shrink in tests (default 10 s) -->
                         <stormlog.replica.lag.max.ms>2000</stormlog.replica.lag.max.ms>
+                        <!-- Shorter broker session timeout in tests (default 9 s) -->
+                        <stormlog.session.timeout.ms>3000</stormlog.session.timeout.ms>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>

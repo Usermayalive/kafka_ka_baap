@@ -38,7 +38,12 @@ public class MetadataQuorum implements AutoCloseable {
 
     public static final RaftGroupId GROUP_ID =
             RaftGroupId.valueOf(UUID.nameUUIDFromBytes("stormlog-metadata".getBytes(StandardCharsets.UTF_8)));
-    public static final long DEFAULT_SESSION_TIMEOUT_MS = 3_000;
+    /**
+     * Brokers silent for longer than this are unregistered. 9 s is Kafka's default
+     * (broker.session.timeout.ms): long enough to ride out a metadata leader election, during
+     * which heartbeats fail; 3 s fenced healthy brokers at startup.
+     */
+    public static final long DEFAULT_SESSION_TIMEOUT_MS = Long.getLong("stormlog.session.timeout.ms", 9_000);
     private static final long HEARTBEAT_INTERVAL_MS = 500;
     /** A learner within this many entries of the leader's commit index counts as caught up. */
     private static final long CATCH_UP_SLACK = 5;

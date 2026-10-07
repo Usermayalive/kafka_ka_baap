@@ -29,8 +29,13 @@ mkdir -p "$(dirname "$OUT")"
 echo "config,records,record_size,seconds,records_per_sec,mb_per_sec,p50_ms,p99_ms,errors,rate" > "$OUT"
 run() { # label topic acks [mode]
   perf "$2" 50000 1024 5 "${4:-plain}" 0 "$3" >/dev/null # warmup
-  echo "$1,$(perf "$2" 200000 1024 5 "${4:-plain}" 0 "$3"),max" | tee -a "$OUT"
-  echo "$1,$(perf "$2" 150000 1024 5 "${4:-plain}" 5000 "$3"),5000" | tee -a "$OUT"
+  for spec in "200000 0 max" "150000 5000 5000"; do
+    set -- "$1" "$2" "$3" "${4:-plain}" $spec
+    line="$(perf "$2" "$5" 1024 5 "$4" "$6" "$3")"
+    errors=$(echo "$line" | cut -d, -f8)
+    if [ "$errors" != "0" ]; then echo "FAILED: $1 had $errors errored requests: $line" >&2; exit 1; fi
+    echo "$1,$line,$7" | tee -a "$OUT"
+  done
 }
 run "RF=1 acks=1" rf1 1
 run "RF=3 acks=1" rf3 1

@@ -43,7 +43,20 @@ public class StormLogPerf {
             runBatched(hostPort[0], Integer.parseInt(hostPort[1]), topic, records, recordSize, inFlight, intervalNanos, acks);
             System.exit(0);
         }
-        try (BrokerConnection conn = BrokerConnection.connect(hostPort[0], Integer.parseInt(hostPort[1]))) {
+        // Connect to the partition's current leader (not necessarily the bootstrap broker)
+        String leaderHost = hostPort[0];
+        int leaderPort = Integer.parseInt(hostPort[1]);
+        try (com.simplekafka.client.SimpleKafkaClient meta =
+                     new com.simplekafka.client.SimpleKafkaClient(hostPort[0], Integer.parseInt(hostPort[1]), "perf")) {
+            meta.initialize();
+            for (com.simplekafka.client.SimpleKafkaClient.PartitionLayout p : meta.topicLayouts().getOrDefault(topic, java.util.List.of())) {
+                if (p.partition() == 0 && meta.getBrokers().containsKey(p.leader())) {
+                    leaderHost = meta.getBrokers().get(p.leader()).getHost();
+                    leaderPort = meta.getBrokers().get(p.leader()).getPort();
+                }
+            }
+        }
+        try (BrokerConnection conn = BrokerConnection.connect(leaderHost, leaderPort)) {
             long producerId = KafkaFrame.NO_PRODUCER_ID;
             if (idempotent) {
                 ByteArrayOutputStream b = new ByteArrayOutputStream();

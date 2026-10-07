@@ -149,6 +149,22 @@ Topic and group names are chosen by clients, so per-label series are unbounded i
 monitoring system. Each labeled family is capped and overflows into `__other__`; per-partition
 detail is served on demand from `/admin/lag` instead of being scraped continuously.
 
+### 21b. Client-side batching with range-based idempotence
+Kafka's 9x lead on small records was entirely its producer's batching. `PRODUCE_BATCH` appends a
+batch contiguously under one lock with one group commit; idempotence generalizes from single
+sequences to sequence ranges (a single record is a batch of one), so a retried batch is
+deduplicated as a unit. The producer follows Kafka's accumulator design: full batches close into a
+ready queue and `send()` blocks above a 32 MB buffer. The first version let an open batch grow
+while the sender waited, which produced frames over the 16 MB limit under load.
+
+### 21c. Replicating producer state instead of rebuilding it from the log
+Kafka rebuilds idempotent producer state on a new leader from producer IDs stored in record
+batches. StormLog's log format has no producer IDs, so the leader ships its producer states with
+each replica fetch instead. The invariant that makes this safe: the snapshot and the log end are
+captured together under the idempotence lock, only records below that log end are sent, followers
+adopt an entry only once their log covers it, and truncation drops entries for removed records.
+Without it, an idempotent producer lost 2,899 of 3,000 sends across a leader crash.
+
 ### 22. Benchmarks only through the broker's real path
 Early numbers (~220K op/s) measured `WriteAheadLog`, which the broker never ran; the broker was
 doing ~120 op/s. Published numbers now come from `BrokerBenchmark` (real Netty connections
