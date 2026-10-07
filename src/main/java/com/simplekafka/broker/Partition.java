@@ -79,6 +79,14 @@ public class Partition {
     private final List<SegmentInfo> segments;
 
     // Group commit state (PHYSICAL_FSYNC only), guarded by flushMonitor
+    // Replication: high watermark (-1 = not replicated, HW tracks the log end), append/HW signal,
+    // and the leader-epoch cache used to find where a follower's log diverges from a new leader's
+    private volatile long highWatermark = -1;
+    private final Object replicationSignal = new Object();
+    private long lastHwCheckpointNanos;
+    private final LeaderEpochCache leaderEpochs;
+    private volatile boolean tieringEnabled = true;
+
     private final Object flushMonitor = new Object();
     private long durableUpToOffset = -1;
     private boolean flushInProgress = false;
@@ -100,6 +108,7 @@ public class Partition {
         this.durabilityMode = durabilityMode;
         this.tiered = tiered;
         this.topicName = new File(topicBaseDir).getName();
+        this.leaderEpochs = new LeaderEpochCache(new File(topicBaseDir + File.separator + "partition-" + id, LeaderEpochCache.FILE));
         this.baseDir = topicBaseDir + File.separator + "partition-" + id;
         this.nextOffset = new AtomicLong(0);
         this.lock = new ReentrantReadWriteLock();
@@ -116,6 +125,7 @@ public class Partition {
 
         // Tiered storage state, guarded by the partition lock
         boolean uploaded;
+        boolean uploading;
         boolean local = true;
 
         public SegmentInfo(long baseOffset, File logFile, File indexFile, long currentMessageCount) {
@@ -174,17 +184,15 @@ public class Partition {
                 // .meta covers offsets compaction removed from the tail (e.g. tombstoned keys)
                 nextOffset.set(Math.max(fromIndex, readMetaNextOffset()));
                 openSegmentForAppend(lastSegment);
-                if (tiered != null) {
-                    for (SegmentInfo segment : new ArrayList<>(segments.subList(0, segments.size() - 1))) {
-                        if (!segment.uploaded) {
-                            scheduleUpload(segment); // sealed before a crash, never uploaded
-                        }
-                    }
-                }
             } else {
                 createNewSegment(0);
                 nextOffset.set(readMetaNextOffset());
             }
+            long checkpointedHw = readHighWatermarkCheckpoint();
+            if (checkpointedHw >= 0) {
+                highWatermark = Math.min(checkpointedHw, nextOffset.get());
+            }
+            maybeUploadSealedSegments(); // sealed before a crash, never uploaded
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to initialize partition " + id, e);
             throw new RuntimeException("Failed to initialize partition", e);
@@ -290,16 +298,36 @@ public class Partition {
      * concurrent producers still share one group commit.
      */
     public long appendBuffered(byte[] message) throws IOException {
+        return appendAt(-1, message);
+    }
+
+    /**
+     * Follower append at the offset the leader assigned. Offsets may skip (compaction gaps on
+     * the leader) but never go backwards: divergent tails are removed with {@link #truncateTo}
+     * first. Waits for this partition's durability mode before returning, so the follower's
+     * next fetch offset (which acknowledges the record to the leader) is honest.
+     */
+    public long appendReplicated(long offset, byte[] message) throws IOException {
+        long assigned = appendAt(offset, message);
+        awaitDurable(assigned);
+        return assigned;
+    }
+
+    private long appendAt(long requestedOffset, byte[] message) throws IOException {
+        long currentOffset;
         lock.writeLock().lock();
         try {
+            currentOffset = requestedOffset < 0 ? nextOffset.get() : requestedOffset;
+            if (currentOffset < nextOffset.get()) {
+                throw new IOException("Replicated offset " + currentOffset + " is below the log end " + nextOffset.get()
+                        + " of " + topicName + "-" + id + "; truncate first");
+            }
             if (activeLogChannel.size() > 0 && activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
-                SegmentInfo sealed = segments.get(segments.size() - 1);
-                createNewSegment(nextOffset.get());
-                scheduleUpload(sealed);
+                createNewSegment(currentOffset);
+                maybeUploadSealedSegments();
             }
 
             long currentPosition = activeLogChannel.position();
-            long currentOffset = nextOffset.get();
 
             // Write to log file
             ByteBuffer buffer = ByteBuffer.allocate(4 + message.length);
@@ -318,11 +346,14 @@ public class Partition {
             SegmentInfo activeSegment = segments.get(segments.size() - 1);
             activeSegment.currentMessageCount++;
 
-            nextOffset.incrementAndGet();
-            return currentOffset;
+            nextOffset.set(currentOffset + 1);
         } finally {
             lock.writeLock().unlock();
         }
+        synchronized (replicationSignal) {
+            replicationSignal.notifyAll(); // wake replica fetches long-polling for new data
+        }
+        return currentOffset;
     }
 
     private void updateIndex(long offset, long position) throws IOException {
@@ -420,6 +451,11 @@ public class Partition {
      * compaction gaps are reported faithfully.
      */
     public List<Record> readRecords(long offset, int maxBytes) throws IOException {
+        return readRecords(offset, maxBytes, Long.MAX_VALUE);
+    }
+
+    /** As {@link #readRecords(long, int)}, but only records with offset below {@code maxOffsetExclusive}. */
+    public List<Record> readRecords(long offset, int maxBytes, long maxOffsetExclusive) throws IOException {
         lock.readLock().lock();
         try {
             if (offset >= nextOffset.get() || segments.isEmpty()) {
@@ -452,6 +488,9 @@ public class Partition {
                         index.seek(e * INDEX_ENTRY_BYTES);
                         long recordOffset = index.readLong();
                         long position = index.readLong();
+                        if (recordOffset >= maxOffsetExclusive) {
+                            return records;
+                        }
                         log.seek(position);
                         int size = log.readInt();
                         if (!records.isEmpty() && bytesRead + 4 + size > maxBytes) {
@@ -473,6 +512,157 @@ public class Partition {
     /** Offset the next append will receive (the log end offset). */
     public long getNextOffset() {
         return nextOffset.get();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Replication support
+    // ---------------------------------------------------------------------------------
+
+    public LeaderEpochCache leaderEpochs() {
+        return leaderEpochs;
+    }
+
+    /** Records below this offset are on every in-sync replica; consumers never read past it. */
+    public long getHighWatermark() {
+        long hw = highWatermark;
+        return hw < 0 ? nextOffset.get() : Math.min(hw, nextOffset.get());
+    }
+
+    public boolean isReplicated() {
+        return highWatermark >= 0;
+    }
+
+    /** Switches to replicated mode (HW managed by the leader) and sets the high watermark. */
+    public void setHighWatermark(long hw) {
+        synchronized (replicationSignal) {
+            highWatermark = Math.max(0, hw);
+            replicationSignal.notifyAll();
+        }
+        long now = System.nanoTime();
+        if (now - lastHwCheckpointNanos > TimeUnit.MILLISECONDS.toNanos(200)) {
+            lastHwCheckpointNanos = now;
+            writeHighWatermarkCheckpoint(highWatermark);
+        }
+        maybeUploadSealedSegments();
+    }
+
+    /** Blocks until the high watermark passes {@code offset} (acks=all). */
+    public boolean awaitHighWatermark(long offset, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        synchronized (replicationSignal) {
+            while (getHighWatermark() <= offset) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                TimeUnit.NANOSECONDS.timedWait(replicationSignal, remaining);
+            }
+            return true;
+        }
+    }
+
+    /** Long-poll for replica fetches: blocks until the log end passes {@code offset} or the timeout. */
+    public void awaitAppendBeyond(long offset, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        synchronized (replicationSignal) {
+            while (nextOffset.get() <= offset) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return;
+                }
+                TimeUnit.NANOSECONDS.timedWait(replicationSignal, remaining);
+            }
+        }
+    }
+
+    /**
+     * Removes every record with offset >= {@code offset} (a follower's divergent, uncommitted
+     * tail). Never touches remote segments: anything tiered is below the high watermark.
+     */
+    public void truncateTo(long offset) throws IOException {
+        lock.writeLock().lock();
+        try {
+            if (offset >= nextOffset.get()) {
+                return;
+            }
+            LOGGER.warning("Partition " + topicName + "-" + id + ": truncating log from " + nextOffset.get() + " to " + offset);
+            while (segments.size() > 1 && segments.get(segments.size() - 1).baseOffset >= offset) {
+                SegmentInfo removed = segments.remove(segments.size() - 1);
+                if (!removed.local) {
+                    throw new IOException("Refusing to truncate into remote segment " + removed.baseOffset);
+                }
+                activeLogChannel.close();
+                activeLogFile.close();
+                activeIndexChannel.close();
+                activeIndexFile.close();
+                removed.logFile.delete();
+                removed.indexFile.delete();
+                openSegmentForAppend(segments.get(segments.size() - 1));
+            }
+            SegmentInfo last = segments.get(segments.size() - 1);
+            if (!last.local) {
+                throw new IOException("Refusing to truncate into remote segment " + last.baseOffset);
+            }
+            activeLogChannel.close();
+            activeLogFile.close();
+            activeIndexChannel.close();
+            activeIndexFile.close();
+            try (RandomAccessFile index = new RandomAccessFile(last.indexFile, "rw");
+                 RandomAccessFile log = new RandomAccessFile(last.logFile, "rw")) {
+                long entries = index.length() / INDEX_ENTRY_BYTES;
+                long keep = firstEntryAtOrAfter(index, entries, offset);
+                if (keep < entries) {
+                    index.seek(keep * INDEX_ENTRY_BYTES + 8);
+                    log.setLength(index.readLong());
+                    index.setLength(keep * INDEX_ENTRY_BYTES);
+                }
+                last.currentMessageCount = keep;
+            }
+            openSegmentForAppend(last);
+            nextOffset.set(offset);
+            if (readMetaNextOffset() > offset) {
+                writeMetaNextOffset(offset); // the truncated offsets were never committed
+            }
+            if (highWatermark > offset) {
+                highWatermark = offset;
+            }
+            leaderEpochs.truncateFromEnd(offset);
+            synchronized (flushMonitor) {
+                durableUpToOffset = Math.min(durableUpToOffset, offset - 1);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private static final String HW_CHECKPOINT = ".high_watermark";
+
+    private void writeHighWatermarkCheckpoint(long hw) {
+        try {
+            Path tmp = Paths.get(baseDir, HW_CHECKPOINT + ".tmp");
+            Files.writeString(tmp, Long.toString(hw));
+            Files.move(tmp, Paths.get(baseDir, HW_CHECKPOINT), StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "High watermark checkpoint failed", e); // advisory: recomputed by the leader
+        }
+    }
+
+    private long readHighWatermarkCheckpoint() {
+        try {
+            Path file = Paths.get(baseDir, HW_CHECKPOINT);
+            return Files.exists(file) ? Long.parseLong(Files.readString(file).trim()) : -1;
+        } catch (IOException | NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** Only a partition's leader tiers its segments (replicas would upload the same objects). */
+    public void setTieringEnabled(boolean enabled) {
+        tieringEnabled = enabled;
+        if (enabled) {
+            maybeUploadSealedSegments();
+        }
     }
 
     /** Index of the last segment whose base offset is <= offset, or 0 if offset precedes all segments. */
@@ -773,7 +963,27 @@ public class Partition {
     private static final String REMOTE_MANIFEST = ".remote_segments";
     private static final String REMOTE_CACHE_DIR = ".remote_cache";
 
-    /** Called with the write lock held, or from initialize(). */
+    /** Uploads sealed segments whose every record is below the high watermark (committed). */
+    private void maybeUploadSealedSegments() {
+        if (tiered == null || !tieringEnabled) {
+            return;
+        }
+        lock.writeLock().lock();
+        try {
+            long hw = getHighWatermark();
+            for (int i = 0; i < segments.size() - 1; i++) {
+                SegmentInfo segment = segments.get(i);
+                if (segment.local && !segment.uploaded && !segment.uploading && segments.get(i + 1).baseOffset <= hw) {
+                    segment.uploading = true;
+                    scheduleUpload(segment);
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Called with the write lock held. */
     private void scheduleUpload(SegmentInfo segment) {
         if (tiered == null) {
             return;
@@ -785,6 +995,7 @@ public class Partition {
         pendingUploads.add(upload);
         upload.whenComplete((v, e) -> {
             pendingUploads.remove(upload);
+            segment.uploading = false;
             if (e != null) {
                 // Stays local and un-uploaded; retried on the next broker start
                 LOGGER.log(Level.WARNING, "Partition " + topicName + "-" + id + ": upload of segment "
