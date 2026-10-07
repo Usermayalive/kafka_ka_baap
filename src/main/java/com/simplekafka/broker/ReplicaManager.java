@@ -3,7 +3,9 @@ package com.simplekafka.broker;
 import com.simplekafka.client.BrokerConnection;
 import com.simplekafka.client.BrokerErrorException;
 import com.simplekafka.metadata.MetadataImage;
+import com.simplekafka.network.IdempotenceManager;
 import com.simplekafka.network.KafkaFrame;
+import com.simplekafka.network.ProducerState;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -239,7 +241,7 @@ public class ReplicaManager implements AutoCloseable {
             long epochEnd = partition.leaderEpochs().endOffsetFor(req.lastFetchedEpoch(), partition.getNextOffset());
             long truncateTo = epochEnd >= 0 ? epochEnd : partition.getHighWatermark();
             if (truncateTo < req.fetchOffset()) {
-                return response(frame, leader, truncateTo, List.of(), List.of());
+                return response(frame, leader, truncateTo, List.of(), List.of(), List.of());
             }
         }
 
@@ -247,12 +249,18 @@ public class ReplicaManager implements AutoCloseable {
         if (req.fetchOffset() >= partition.getNextOffset()) {
             partition.awaitAppendBeyond(req.fetchOffset(), Math.min(req.maxWaitMs(), FETCH_MAX_WAIT_MS));
         }
-        List<Partition.Record> records = partition.readRecords(req.fetchOffset(), Math.min(req.maxBytes(), FETCH_MAX_BYTES));
-        return response(frame, leader, -1, partition.leaderEpochs().entries(), records);
+        // Producer state and log end are captured together; only records below that log end are
+        // sent, so every idempotent record in this response has its producer's state in it too
+        IdempotenceManager.ReplicationSnapshot producers = broker.getIdempotenceManager()
+                .snapshotForReplication(req.topic(), req.partition(), partition::getNextOffset);
+        List<Partition.Record> records = partition.readRecords(req.fetchOffset(),
+                Math.min(req.maxBytes(), FETCH_MAX_BYTES), producers.logEndOffset());
+        return response(frame, leader, -1, partition.leaderEpochs().entries(), records, producers.states());
     }
 
     private KafkaFrame response(KafkaFrame frame, LeaderState leader, long divergingEnd,
-                                List<LeaderEpochCache.Entry> epochs, List<Partition.Record> records) throws IOException {
+                                List<LeaderEpochCache.Entry> epochs, List<Partition.Record> records,
+                                List<ProducerState> producers) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         DataOutputStream out = new DataOutputStream(bytes);
         out.writeShort(KafkaFrame.ERROR_NONE);
@@ -269,6 +277,10 @@ public class ReplicaManager implements AutoCloseable {
             out.writeLong(r.offset());
             out.writeInt(r.payload().length);
             out.write(r.payload());
+        }
+        out.writeInt(producers.size());
+        for (ProducerState p : producers) {
+            p.writeTo(out);
         }
         return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), bytes.toByteArray());
     }
@@ -413,6 +425,7 @@ public class ReplicaManager implements AutoCloseable {
                 LOGGER.warning("Broker " + brokerId + ": " + tp.topic() + "-" + tp.partition()
                         + " diverged from leader " + leaderId + "; truncating " + partition.getNextOffset() + " -> " + divergingEnd);
                 partition.truncateTo(divergingEnd);
+                broker.getIdempotenceManager().truncate(tp.topic(), tp.partition(), divergingEnd);
                 return;
             }
             for (int n = in.readInt(); n > 0; n--) {
@@ -420,6 +433,15 @@ public class ReplicaManager implements AutoCloseable {
                 byte[] payload = new byte[in.readInt()];
                 in.readFully(payload);
                 partition.appendReplicated(offset, payload);
+            }
+            List<ProducerState> producers = new ArrayList<>();
+            for (int n = in.readInt(); n > 0; n--) {
+                producers.add(ProducerState.readFrom(in));
+            }
+            if (!producers.isEmpty()) {
+                IdempotenceManager idempotence = broker.getIdempotenceManager();
+                idempotence.registerPartitionDir(tp.topic(), tp.partition(), new java.io.File(partition.getBaseDir()));
+                idempotence.applyReplicated(tp.topic(), tp.partition(), producers, partition.getNextOffset());
             }
             for (LeaderEpochCache.Entry e : epochs) {
                 if (e.startOffset() < partition.getNextOffset()) { // epochs we now hold records of

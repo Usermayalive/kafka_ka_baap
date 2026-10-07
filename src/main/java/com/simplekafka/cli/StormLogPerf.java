@@ -18,8 +18,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * per request (StormLog's client does not batch).
  *
  * <pre>
- * StormLogPerf HOST:PORT TOPIC NUM_RECORDS RECORD_SIZE IN_FLIGHT [idempotent|plain] [RECORDS_PER_SEC] [all|1]
+ * StormLogPerf HOST:PORT TOPIC NUM_RECORDS RECORD_SIZE IN_FLIGHT [idempotent|plain|batched] [RECORDS_PER_SEC] [all|1]
  * </pre>
+ * "batched" uses {@link com.simplekafka.client.BatchingProducer} with Kafka's default batching
+ * (16 KB, linger 5 ms; IN_FLIGHT batches): the like-for-like comparison with Kafka's producer.
  * With RECORDS_PER_SEC, sends are paced on a fixed schedule (like kafka-producer-perf-test
  * --throughput), so latency is measured below saturation instead of including queueing.
  * Prints one CSV line: records,record_size,seconds,records_per_sec,mb_per_sec,p50_ms,p99_ms,errors
@@ -37,6 +39,10 @@ public class StormLogPerf {
         long intervalNanos = ratePerSec > 0 ? 1_000_000_000L / ratePerSec : 0;
         byte acks = args.length > 7 && args[7].equals("all") ? KafkaFrame.ACKS_ALL : KafkaFrame.ACKS_LEADER;
 
+        if (args.length > 5 && args[5].equals("batched")) {
+            runBatched(hostPort[0], Integer.parseInt(hostPort[1]), topic, records, recordSize, inFlight, intervalNanos, acks);
+            System.exit(0);
+        }
         try (BrokerConnection conn = BrokerConnection.connect(hostPort[0], Integer.parseInt(hostPort[1]))) {
             long producerId = KafkaFrame.NO_PRODUCER_ID;
             if (idempotent) {
@@ -79,6 +85,46 @@ public class StormLogPerf {
                     latencies[records / 2] / 1e6, latencies[(int) (records * 0.99)] / 1e6, errors.get());
         }
         System.exit(0);
+    }
+
+    private static void runBatched(String host, int port, String topic, int records, int recordSize, int inFlight,
+                                   long intervalNanos, byte acks) throws Exception {
+        byte[] payload = new byte[recordSize];
+        Arrays.fill(payload, (byte) 'x');
+        long[] latencies = new long[records];
+        AtomicLong errors = new AtomicLong();
+        com.simplekafka.client.BatchingProducer.Config config = com.simplekafka.client.BatchingProducer.Config.defaults()
+                .withAcks(acks);
+        config = new com.simplekafka.client.BatchingProducer.Config(config.batchBytes(), config.lingerMs(), inFlight,
+                acks, false, config.deliveryTimeoutMs());
+        try (com.simplekafka.client.SimpleKafkaClient client = new com.simplekafka.client.SimpleKafkaClient(host, port, "perf");
+             com.simplekafka.client.BatchingProducer producer = new com.simplekafka.client.BatchingProducer(client, config)) {
+            client.initialize();
+            long start = System.nanoTime();
+            for (int i = 0; i < records; i++) {
+                if (intervalNanos > 0) {
+                    long due = start + i * intervalNanos;
+                    while (System.nanoTime() < due) {
+                        Thread.onSpinWait();
+                    }
+                }
+                final int index = i;
+                final long sentAt = System.nanoTime();
+                producer.send(topic, 0, payload).whenComplete((offset, err) -> {
+                    if (err != null) {
+                        errors.incrementAndGet();
+                    }
+                    latencies[index] = System.nanoTime() - sentAt;
+                });
+            }
+            producer.flush();
+            double seconds = (System.nanoTime() - start) / 1e9;
+            Arrays.sort(latencies);
+            double recordsPerSec = records / seconds;
+            System.out.printf(Locale.ROOT, "%d,%d,%.3f,%.1f,%.3f,%.3f,%.3f,%d%n", records, recordSize, seconds,
+                    recordsPerSec, recordsPerSec * recordSize / (1024.0 * 1024.0),
+                    latencies[records / 2] / 1e6, latencies[(int) (records * 0.99)] / 1e6, errors.get());
+        }
     }
 
     private static byte[] request(String topic, long producerId, int sequence, byte[] payload, byte acks) throws IOException {

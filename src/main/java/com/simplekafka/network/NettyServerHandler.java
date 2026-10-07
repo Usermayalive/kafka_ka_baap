@@ -106,6 +106,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
     private static String apiName(short apiKey) {
         return switch (apiKey) {
             case KafkaFrame.API_KEY_PRODUCE -> "produce";
+            case KafkaFrame.API_KEY_PRODUCE_BATCH -> "produce_batch";
             case KafkaFrame.API_KEY_FETCH -> "fetch";
             case KafkaFrame.API_KEY_INIT_PRODUCER_ID -> "init_producer_id";
             case KafkaFrame.API_KEY_METADATA -> "metadata";
@@ -132,6 +133,8 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                 return handleInitProducerId(frame);
             case KafkaFrame.API_KEY_PRODUCE:
                 return handleProduce(frame);
+            case KafkaFrame.API_KEY_PRODUCE_BATCH:
+                return handleProduceBatch(frame);
             case KafkaFrame.API_KEY_FETCH:
                 return handleFetch(frame);
             case KafkaFrame.API_KEY_METADATA:
@@ -594,6 +597,106 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                             + " (leader: " + partition.getLeader() + ")");
         }
         return null;
+    }
+
+    /**
+     * Many records to one partition in one request (client-side batching).
+     * Request: [clientId][topic][partition:4][producerId:8][epoch:2][baseSequence:4][count:4]
+     *          {[len:4][bytes]}[acks:1]
+     * Response: [error][topic][partition:4][baseOffset:8][count:4][duplicate:1]
+     * Records get contiguous offsets from baseOffset. With a producer ID the batch is idempotent
+     * as a unit: a retry returns the original base offset without appending.
+     */
+    private KafkaFrame handleProduceBatch(KafkaFrame frame) throws Exception {
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frame.getPayload()));
+        String clientId = dis.readUTF();
+        String topic = dis.readUTF();
+        int partitionId = dis.readInt();
+        long producerId = dis.readLong();
+        short epoch = dis.readShort();
+        int baseSequence = dis.readInt();
+        int count = dis.readInt();
+        if (count <= 0 || count > 100_000) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_CORRUPT_MESSAGE,
+                    "Invalid batch record count " + count);
+        }
+        java.util.List<byte[]> messages = new java.util.ArrayList<>(count);
+        long totalBytes = 0;
+        for (int i = 0; i < count; i++) {
+            byte[] message = new byte[dis.readInt()];
+            dis.readFully(message);
+            messages.add(message);
+            totalBytes += message.length;
+        }
+        byte acks = dis.available() > 0 ? dis.readByte() : KafkaFrame.ACKS_LEADER;
+
+        try {
+            quotaManager.checkAndConsume(clientId, (int) Math.min(Integer.MAX_VALUE, totalBytes));
+        } catch (QuotaExceededException qe) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_QUOTA_EXCEEDED, qe.getMessage());
+        }
+        Partition partition = broker.hostedPartition(topic, partitionId);
+        KafkaFrame notLeader = rejectIfNotLeader(frame, topic, partitionId, partition);
+        if (notLeader != null) {
+            return notLeader;
+        }
+        // Every record is validated (and PII-encrypted); one bad record rejects the whole batch
+        java.util.List<byte[]> stored = new java.util.ArrayList<>(count);
+        try {
+            for (byte[] message : messages) {
+                stored.add(broker.getSchemaService().onProduce(topic, message));
+            }
+        } catch (com.simplekafka.schema.SchemaViolationException sve) {
+            return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_SCHEMA_VIOLATION,
+                    sve.getMessage());
+        }
+        for (byte[] record : stored) {
+            broker.getMetrics().recordProduce(topic, record.length);
+        }
+        if (acks == KafkaFrame.ACKS_ALL) {
+            java.util.Set<Integer> isr = broker.getReplicaManager() == null ? null
+                    : broker.getReplicaManager().isrOf(topic, partitionId);
+            if (isr != null && isr.size() < broker.getMinInsyncReplicas()) {
+                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_ENOUGH_REPLICAS,
+                        topic + "-" + partitionId + " has " + isr.size() + " in-sync replica(s); acks=all needs "
+                                + broker.getMinInsyncReplicas());
+            }
+        }
+
+        long baseOffset;
+        boolean duplicate = false;
+        if (producerId == KafkaFrame.NO_PRODUCER_ID) {
+            baseOffset = partition.appendBufferedBatch(stored);
+        } else {
+            idempotenceManager.registerPartitionDir(topic, partitionId, new File(partition.getBaseDir()));
+            try {
+                IdempotenceManager.IdempotentResult result = idempotenceManager.verifyAndApply(topic, partitionId,
+                        producerId, epoch, baseSequence, count, () -> partition.appendBufferedBatch(stored));
+                baseOffset = result.offset();
+                duplicate = result.isDuplicate();
+            } catch (ProducerFencedException e) {
+                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_PRODUCER_FENCED, e.getMessage());
+            } catch (DuplicateSequenceException e) {
+                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_DUPLICATE_SEQUENCE, e.getMessage());
+            } catch (OutOfOrderSequenceException e) {
+                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_OUT_OF_ORDER_SEQUENCE, e.getMessage());
+            }
+        }
+        long lastOffset = baseOffset + count - 1;
+        partition.awaitDurable(lastOffset); // one group commit for the whole batch
+        KafkaFrame notReplicated = awaitReplication(frame, partition, lastOffset, acks);
+        if (notReplicated != null) {
+            return notReplicated;
+        }
+        final long responseBase = baseOffset;
+        final boolean responseDuplicate = duplicate;
+        return okFrame(frame, out -> {
+            out.writeUTF(topic);
+            out.writeInt(partitionId);
+            out.writeLong(responseBase);
+            out.writeInt(count);
+            out.writeBoolean(responseDuplicate);
+        });
     }
 
     /** acks=all: wait until every in-sync replica has the record (the HW passes it). */

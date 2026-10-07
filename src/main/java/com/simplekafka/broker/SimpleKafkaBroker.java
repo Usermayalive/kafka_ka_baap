@@ -81,6 +81,7 @@ public class SimpleKafkaBroker {
     private volatile boolean servingReady = true;
     private volatile ReplicaManager replicaManager;
     private volatile int minInsyncReplicas = Integer.getInteger("stormlog.min.insync.replicas", 1);
+    private final IdempotenceManager idempotenceManager = new IdempotenceManager();
     /**
      * Metadata watch callbacks run here, one at a time, never on the metadata-notifier thread:
      * controller reactions make blocking Raft writes, which must not stall later notifications.
@@ -131,7 +132,7 @@ public class SimpleKafkaBroker {
         LOGGER.info("Starting broker " + brokerId + " on " + brokerHost + ":" + brokerPort);
 
         nettyServer = new NettyBrokerServer(brokerHost, brokerPort, this, quotaManager,
-                new IdempotenceManager(),
+                idempotenceManager,
                 new ProducerIdManager((short) brokerId, new File(dataDir(), "producer_id_epoch")),
                 NettyBrokerServer.DEFAULT_REQUEST_QUEUE_CAPACITY);
         nettyServer.start();
@@ -555,6 +556,10 @@ public class SimpleKafkaBroker {
     /** Null when running without a metadata quorum (standalone: no replication). */
     public ReplicaManager getReplicaManager() {
         return replicaManager;
+    }
+
+    public IdempotenceManager getIdempotenceManager() {
+        return idempotenceManager;
     }
 
     /** acks=all produces are rejected while a partition has fewer in-sync replicas than this. */

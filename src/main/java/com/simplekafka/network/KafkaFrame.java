@@ -33,6 +33,7 @@ public class KafkaFrame {
     public static final short API_KEY_GET_SCHEMA = 15;
     public static final short API_KEY_FORGET_ENTITY = 16;
     public static final short API_KEY_REPLICA_FETCH = 17;
+    public static final short API_KEY_PRODUCE_BATCH = 18;
 
     // Error Codes
     public static final short ERROR_NONE = 0;

@@ -17,6 +17,7 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.ExecutionException;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -239,6 +240,44 @@ public class ReplicationTest {
         }
         assertEquals(3, leader.getReplicaManager().isrOf("orders", 0).size(),
                 "Followers keeping up with a moving log end must not be evicted (" + sent + " writes)");
+    }
+
+    @Test
+    void testIdempotentBatchingProducerSurvivesLeaderCrashWithoutDuplicates() throws Exception {
+        createReplicatedTopic("orders");
+        int oldLeader = state("orders").leader();
+        int bootstrapId = brokers.keySet().stream().filter(id -> id != oldLeader).findFirst().orElseThrow();
+        try (SimpleKafkaClient producerClient = new SimpleKafkaClient("127.0.0.1", brokers.get(bootstrapId).getPort());
+             com.simplekafka.client.BatchingProducer producer = new com.simplekafka.client.BatchingProducer(producerClient,
+                     com.simplekafka.client.BatchingProducer.Config.defaults().withIdempotence(true))) {
+            producerClient.initialize();
+            List<CompletableFuture<Long>> futures = new ArrayList<>();
+            for (int i = 0; i < 3_000; i++) {
+                futures.add(producer.send("orders", 0, ("r" + i).getBytes(StandardCharsets.UTF_8)));
+                if (i == 1_000) {
+                    brokers.remove(oldLeader).crashForTest(); // mid-stream: in-flight batches must retry
+                }
+                if (i % 100 == 0) {
+                    Thread.sleep(2);
+                }
+            }
+            producer.flush();
+            int failed = 0;
+            for (CompletableFuture<Long> f : futures) {
+                try {
+                    f.get(1, TimeUnit.SECONDS);
+                } catch (ExecutionException e) {
+                    failed++;
+                }
+            }
+            SimpleKafkaBroker newLeader = brokers.get(state("orders").leader());
+            List<String> log = contents(newLeader.hostedPartition("orders", 0));
+            long distinct = log.stream().map(r -> r.substring(r.indexOf(':') + 1)).distinct().count();
+            System.out.println("Batching producer across leader crash: " + log.size() + " records, " + failed + " failed sends");
+            assertEquals(0, failed, "Replicated producer state lets every batch retry succeed on the new leader");
+            assertEquals(3_000, log.size(), "Every record is in the log exactly once");
+            assertEquals(log.size(), distinct, "No record appended twice (idempotent batch retries)");
+        }
     }
 
     @Test

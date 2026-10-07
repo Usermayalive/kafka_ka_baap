@@ -2,9 +2,9 @@
 # StormLog vs Apache Kafka on the same machine and workload: one broker process each, one
 # partition, acks=1, page-cache durability (both systems' default), 1 GB heap each.
 #
-# Kafka runs twice per record size:
-#   kafka-unbatched  batch.size=0, linger.ms=0: one record per request, like StormLog's client
-#   kafka-batched    producer defaults (batching): what Kafka users actually get
+# Each system runs twice per record size:
+#   unbatched  one record per request (Kafka: batch.size=0, linger.ms=0)
+#   batched    producer batching with Kafka's defaults on both sides (16 KB batches, linger 5 ms)
 # Both producers keep up to 5 requests in flight (Kafka's default max.in.flight).
 #
 #   KAFKA_HOME=/path/to/kafka_2.13-4.3.1 ./scripts/bench-vs-kafka.sh [out.csv]
@@ -48,8 +48,8 @@ PY
 }
 
 # ---------------- StormLog ----------------
-stormlog_perf() { # size records [rate] -> rps,mbps,p50,p99,seconds
-  java -cp "$JAR" com.simplekafka.cli.StormLogPerf 127.0.0.1:29092 perf "$2" "$1" 5 plain "${3:-0}" 2>/dev/null \
+stormlog_perf() { # size records [rate] [mode] -> rps,mbps,p50,p99,seconds
+  java -cp "$JAR" com.simplekafka.cli.StormLogPerf 127.0.0.1:29092 perf "$2" "$1" 5 "${4:-plain}" "${3:-0}" 1 2>/dev/null \
     | awk -F, '{print $4","$5","$6","$7","$3}'
 }
 echo "== StormLog (work dir $WORK)"
@@ -64,6 +64,7 @@ stormlog_perf 1024 50000 >/dev/null # warmup (JIT)
 for size in $SIZES; do
   n=$(records_for "$size")
   measure "$SL_PID" stormlog unbatched "$size" "$n" stormlog_perf "$size" "$n"
+  measure "$SL_PID" stormlog batched "$size" "$n" stormlog_perf "$size" "$n" 0 batched
 done
 for size in $SIZES; do
   measure "$SL_PID" stormlog "fixed-rate-$LATENCY_RATE" "$size" "$LATENCY_RECORDS" stormlog_perf "$size" "$LATENCY_RECORDS" "$LATENCY_RATE"

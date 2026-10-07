@@ -329,6 +329,22 @@ public class SimpleKafkaClient implements AutoCloseable {
         }
     }
 
+    /** Connection to the partition's current leader (per cached metadata). */
+    BrokerConnection leaderConnectionFor(String topic, int partition) throws IOException {
+        return leaderConnection(topic, partition);
+    }
+
+    /** Allocates a producer ID: returns {producerId, epoch}. */
+    long[] initProducerId() throws IOException {
+        DataInputStream in = connection(bootstrapBroker, bootstrapPort).request(KafkaFrame.API_KEY_INIT_PRODUCER_ID,
+                payload(o -> o.writeUTF(clientId)));
+        return new long[]{in.readLong(), in.readShort()};
+    }
+
+    String clientId() {
+        return clientId;
+    }
+
     private BrokerConnection leaderConnection(String topic, int partition) throws IOException {
         for (PartitionLayout p : layout(topic)) {
             if (p.partition() == partition) {

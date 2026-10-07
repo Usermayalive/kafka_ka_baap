@@ -87,6 +87,18 @@ public class ReplicationPrimitivesTest {
     }
 
     @Test
+    void testProducerStateFollowsTheLogItDescribes() throws Exception {
+        com.simplekafka.network.IdempotenceManager idempotence = new com.simplekafka.network.IdempotenceManager();
+        com.simplekafka.network.ProducerState state = new com.simplekafka.network.ProducerState(7L, (short) 0, 9, 14, 0);
+        idempotence.applyReplicated("t", 0, List.of(state), 10);
+        assertNull(idempotence.getProducerState("t", 0, 7L), "Not adopted until the replica holds offset 14");
+        idempotence.applyReplicated("t", 0, List.of(state), 15);
+        assertEquals(9, idempotence.getProducerState("t", 0, 7L).lastSequenceNumber());
+        idempotence.truncate("t", 0, 12);
+        assertNull(idempotence.getProducerState("t", 0, 7L), "Truncating offset 14 forgets the state that claimed it");
+    }
+
+    @Test
     void testLeaderEpochCacheFindsDivergencePoint() throws Exception {
         Partition p = new Partition(0, tempDir.getAbsolutePath());
         LeaderEpochCache cache = p.leaderEpochs();

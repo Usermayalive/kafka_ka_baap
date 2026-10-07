@@ -71,23 +71,43 @@ public class IdempotenceManager {
             int sequenceNumber,
             AppendAction appendAction
     ) throws Exception {
+        return verifyAndApply(topic, partition, producerId, epoch, sequenceNumber, 1, appendAction);
+    }
+
+    /**
+     * Batch form: the batch covers sequences [firstSequence, firstSequence + count - 1] and
+     * {@code appendAction} appends all its records contiguously, returning the offset of the
+     * FIRST. The dedup window is keyed by a batch's last sequence (mapping to its last record's
+     * offset), so a retried batch returns its original base offset. A single record is a batch of 1.
+     */
+    public IdempotentResult verifyAndApply(
+            String topic,
+            int partition,
+            long producerId,
+            short epoch,
+            int firstSequence,
+            int count,
+            AppendAction appendAction
+    ) throws Exception {
         String partitionKey = topic + "-" + partition;
         Map<Long, ProducerState> pMap = partitionStates.computeIfAbsent(partitionKey, k -> new ConcurrentHashMap<>());
+        int lastSequence = firstSequence + count - 1;
 
         synchronized (pMap) {
             ProducerState existing = pMap.get(producerId);
 
-            if (existing == null) {
-                // First sequence number from a new producer MUST be 0
-                if (sequenceNumber != 0) {
-                    throw new OutOfOrderSequenceException("Expected sequence number 0 for new producer " +
-                            producerId + ", but received: " + sequenceNumber);
+            if (existing == null || epoch > existing.epoch()) {
+                // A new producer, or an epoch bump (failover / restart), must start at sequence 0
+                if (firstSequence != 0) {
+                    throw new OutOfOrderSequenceException("Expected sequence number 0 for "
+                            + (existing == null ? "new producer " + producerId : "epoch bump to " + epoch)
+                            + ", but received: " + firstSequence);
                 }
-                long offset = appendAction.execute();
-                ProducerState newState = new ProducerState(producerId, epoch, 0, offset, System.currentTimeMillis());
-                pMap.put(producerId, newState);
+                long baseOffset = appendAction.execute();
+                pMap.put(producerId, new ProducerState(producerId, epoch, lastSequence, baseOffset + count - 1,
+                        System.currentTimeMillis()));
                 maybePersistSnapshot(partitionKey);
-                return new IdempotentResult(false, offset);
+                return new IdempotentResult(false, baseOffset);
             }
 
             // Zombie Producer Fencing
@@ -96,44 +116,26 @@ public class IdempotenceManager {
                         " is fenced by active broker epoch " + existing.epoch());
             }
 
-            // Epoch Bump (e.g. producer failover / restart)
-            if (epoch > existing.epoch()) {
-                if (sequenceNumber != 0) {
-                    throw new OutOfOrderSequenceException("Expected sequence number 0 after epoch bump to " +
-                            epoch + ", but received: " + sequenceNumber);
-                }
-                long offset = appendAction.execute();
-                ProducerState newState = new ProducerState(producerId, epoch, 0, offset, System.currentTimeMillis());
-                pMap.put(producerId, newState);
+            // Same epoch: a retry of a recent batch returns its original offsets
+            if (existing.hasSequenceInWindow(lastSequence)) {
+                return new IdempotentResult(true, existing.getOffsetForSequence(lastSequence) - (count - 1));
+            }
+
+            if (firstSequence == existing.lastSequenceNumber() + 1) {
+                long baseOffset = appendAction.execute();
+                pMap.put(producerId, existing.advance(lastSequence, baseOffset + count - 1, System.currentTimeMillis()));
                 maybePersistSnapshot(partitionKey);
-                return new IdempotentResult(false, offset);
+                return new IdempotentResult(false, baseOffset);
             }
 
-            // Same Epoch: Check 5-Element Sliding Window for Deduplication
-            if (existing.hasSequenceInWindow(sequenceNumber)) {
-                // DUPLICATE DETECTED within sliding window!
-                // Skip re-appending to storage log; return cached offset
-                return new IdempotentResult(true, existing.getOffsetForSequence(sequenceNumber));
-            }
-
-            if (sequenceNumber == existing.lastSequenceNumber() + 1) {
-                // Expected sequential record
-                long offset = appendAction.execute();
-                ProducerState updated = existing.advance(sequenceNumber, offset, System.currentTimeMillis());
-                pMap.put(producerId, updated);
-                maybePersistSnapshot(partitionKey);
-                return new IdempotentResult(false, offset);
-            }
-
-            if (sequenceNumber > existing.lastSequenceNumber() + 1) {
-                // SEQUENCE GAP DETECTED
+            if (firstSequence > existing.lastSequenceNumber() + 1) {
                 throw new OutOfOrderSequenceException("Sequence gap for producer " + producerId +
-                        ": expected " + (existing.lastSequenceNumber() + 1) + ", but received: " + sequenceNumber);
+                        ": expected " + (existing.lastSequenceNumber() + 1) + ", but received: " + firstSequence);
             }
 
-            // sequenceNumber <= existing.lastSequenceNumber() and NOT in window -> Out-of-window duplicate!
-            throw new DuplicateSequenceException("Duplicate sequence " + sequenceNumber + " for producer " + producerId +
-                    " is too old and fell off the 5-element sliding window (last seen: " +
+            // Already processed, but too old for the dedup window
+            throw new DuplicateSequenceException("Duplicate sequence " + firstSequence + " for producer " + producerId +
+                    " is too old and fell off the " + ProducerState.WINDOW_SIZE + "-batch window (last seen: " +
                     existing.lastSequenceNumber() + ")");
         }
     }
@@ -225,6 +227,67 @@ public class IdempotenceManager {
             LOGGER.info("Recovered " + count + " producer state(s) from " + snapshotFile.getAbsolutePath());
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Failed to load .producer_state snapshot from " + snapshotFile.getAbsolutePath(), e);
+        }
+    }
+
+    /** Producer states plus the log end they're consistent with (taken together). */
+    public record ReplicationSnapshot(java.util.List<ProducerState> states, long logEndOffset) {}
+
+    /**
+     * Leader side of producer-state replication. Taken under the same lock idempotent appends
+     * hold, so every idempotent record below {@code logEndOffset} has its producer's update in
+     * {@code states}. The replica fetch then returns only records below that log end.
+     */
+    public ReplicationSnapshot snapshotForReplication(String topic, int partition, java.util.function.LongSupplier logEnd) {
+        Map<Long, ProducerState> pMap = partitionStates.computeIfAbsent(topic + "-" + partition, k -> new ConcurrentHashMap<>());
+        synchronized (pMap) {
+            return new ReplicationSnapshot(new java.util.ArrayList<>(pMap.values()), logEnd.getAsLong());
+        }
+    }
+
+    /**
+     * Follower side: adopt the leader's producer states that this replica's log now covers
+     * (last offset below {@code followerLogEnd}). Entries not yet covered are re-sent with the
+     * next fetch, so producer state never claims a record this replica doesn't have.
+     */
+    public void applyReplicated(String topic, int partition, java.util.List<ProducerState> states, long followerLogEnd) {
+        String key = topic + "-" + partition;
+        Map<Long, ProducerState> pMap = partitionStates.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
+        boolean changed = false;
+        synchronized (pMap) {
+            for (ProducerState state : states) {
+                if (state.lastOffset() < followerLogEnd) {
+                    ProducerState current = pMap.get(state.producerId());
+                    if (current == null || state.epoch() > current.epoch()
+                            || (state.epoch() == current.epoch() && state.lastSequenceNumber() > current.lastSequenceNumber())) {
+                        pMap.put(state.producerId(), state);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) {
+            maybePersistSnapshot(key);
+        }
+    }
+
+    /**
+     * After a log truncation: forget producer state for records that no longer exist, so a
+     * retry is never "deduplicated" against a truncated record. The leader's states (consistent
+     * with its log) re-populate them on subsequent fetches.
+     */
+    public void truncate(String topic, int partition, long truncatedFrom) {
+        String key = topic + "-" + partition;
+        Map<Long, ProducerState> pMap = partitionStates.get(key);
+        if (pMap == null) {
+            return;
+        }
+        boolean changed;
+        synchronized (pMap) {
+            changed = pMap.values().removeIf(state -> state.lastOffset() >= truncatedFrom);
+        }
+        if (changed) {
+            maybePersistSnapshot(key);
         }
     }
 

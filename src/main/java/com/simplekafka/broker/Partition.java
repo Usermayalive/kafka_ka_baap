@@ -323,34 +323,57 @@ public class Partition {
                 throw new IOException("Replicated offset " + currentOffset + " is below the log end " + nextOffset.get()
                         + " of " + topicName + "-" + id + "; truncate first");
             }
-            if (activeLogChannel.size() > 0 && activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
-                createNewSegment(currentOffset);
-                maybeUploadSealedSegments();
-            }
-
-            long currentPosition = activeLogChannel.position();
-
-            // Write to log file
-            ByteBuffer buffer = ByteBuffer.allocate(4 + message.length);
-            buffer.putInt(message.length);
-            buffer.put(message);
-            buffer.flip();
-
-            while (buffer.hasRemaining()) {
-                activeLogChannel.write(buffer);
-            }
-
-            // Update index file
-            updateIndex(currentOffset, currentPosition);
-
-            // Update segment info
-            SegmentInfo activeSegment = segments.get(segments.size() - 1);
-            activeSegment.currentMessageCount++;
-
-            nextOffset.set(currentOffset + 1);
+            writeRecordLocked(currentOffset, message);
         } finally {
             lock.writeLock().unlock();
         }
+        afterAppend();
+        return currentOffset;
+    }
+
+    /**
+     * Appends a batch contiguously under one lock acquisition (no other producer's records can
+     * interleave) and returns the first record's offset. Callers wait with {@link #awaitDurable}
+     * on the last offset, so the whole batch shares a single group commit.
+     */
+    public long appendBufferedBatch(java.util.List<byte[]> messages) throws IOException {
+        if (messages.isEmpty()) {
+            throw new IllegalArgumentException("Empty batch");
+        }
+        long baseOffset;
+        lock.writeLock().lock();
+        try {
+            baseOffset = nextOffset.get();
+            for (int i = 0; i < messages.size(); i++) {
+                writeRecordLocked(baseOffset + i, messages.get(i));
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+        afterAppend();
+        return baseOffset;
+    }
+
+    /** Write lock held. */
+    private void writeRecordLocked(long offset, byte[] message) throws IOException {
+        if (activeLogChannel.size() > 0 && activeLogChannel.size() + message.length + 4 > MAX_SEGMENT_SIZE) {
+            createNewSegment(offset);
+            maybeUploadSealedSegments();
+        }
+        long position = activeLogChannel.position();
+        ByteBuffer buffer = ByteBuffer.allocate(4 + message.length);
+        buffer.putInt(message.length);
+        buffer.put(message);
+        buffer.flip();
+        while (buffer.hasRemaining()) {
+            activeLogChannel.write(buffer);
+        }
+        updateIndex(offset, position);
+        segments.get(segments.size() - 1).currentMessageCount++;
+        nextOffset.set(offset + 1);
+    }
+
+    private void afterAppend() {
         synchronized (replicationSignal) {
             replicationSignal.notifyAll(); // wake replica fetches long-polling for new data
         }
@@ -358,7 +381,6 @@ public class Partition {
         if (listener != null) {
             listener.run(); // leader: an ISR of one commits on append, without waiting for a fetch
         }
-        return currentOffset;
     }
 
     private void updateIndex(long offset, long position) throws IOException {
