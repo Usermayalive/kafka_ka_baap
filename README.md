@@ -46,9 +46,9 @@ Requires JDK 25. Maven comes with the wrapper.
 ```
 
 A recorded run of the demo is in [`docs/demo-transcript.md`](docs/demo-transcript.md).
-`docker compose up` starts the same cluster plus S3 (SeaweedFS) and Prometheus; see
-[`docker-compose.yml`](docker-compose.yml) (written but **not tested**: the development machine
-has no Docker).
+
+S3 tiering is tested against [SeaweedFS](https://github.com/seaweedfs/seaweedfs)'s S3 API
+(MinIO's community binaries are no longer distributed); any S3-compatible endpoint works.
 
 CLI: `java -cp target-cli/simple-kafka-1.0-SNAPSHOT.jar com.simplekafka.cli.StormLogCli --bootstrap HOST:PORT <command>`
 with `describe`, `create-topic`, `produce`, `produce-batch`, `consume`, `consume-group`,
@@ -77,23 +77,39 @@ The fsync numbers are true-to-disk: on macOS, Java's `force()` takes as long as
 ![StormLog vs Apache Kafka 4.3.1](docs/img/stormlog-vs-kafka.png)
 
 Same Apple M1 laptop, one broker process each (1 GB heap), one partition, `acks=1`, page-cache
-durability (both systems' default), 5 requests in flight. Produced by
+durability (both systems' default), 5 requests in flight, loopback networking. Produced by
 [`scripts/bench-vs-kafka.sh`](scripts/bench-vs-kafka.sh); raw data in
 [`docs/bench/vs-kafka.csv`](docs/bench/vs-kafka.csv).
 
-**Throughput** (max rate, single producer):
+Three scenarios, each with the configuration that defines it:
 
-| Record size | StormLog | Kafka, batching off | Kafka, default batching | StormLog MB/s | Kafka batched MB/s |
-|---|---|---|---|---|---|
-| 64 B | 54K rec/s | 24K rec/s | 479K rec/s | 3 | 29 |
-| 256 B | 53K rec/s | 24K rec/s | 370K rec/s | 13 | 90 |
-| 1 KB | 48K rec/s | 23K rec/s | 132K rec/s | 47 | 129 |
-| 4 KB | 44K rec/s | 19K rec/s | 38K rec/s | 173 | 149 |
-| 16 KB | 28K rec/s | 12K rec/s | 13K rec/s | 439 | 200 |
+**1. Large records (≥ 4 KB): StormLog matches or beats Kafka on bandwidth.**
+Kafka with default producer batching (`linger.ms=5`, `batch.size=16384`) against StormLog (one
+record per request). At this size a batch holds one or two records, so batching stops helping and
+per-request storage overhead decides.
 
-**Latency** at a fixed 5,000 records/s (60 s per size, so producer startup is < 1% of samples):
+| Record size | StormLog | Kafka (batched) |
+|---|---|---|
+| 4 KB | 173 MB/s | 149 MB/s |
+| 16 KB | 439 MB/s | 200 MB/s |
 
-| Record size | StormLog p50 / p99 | Kafka (batching off) p50 / p99 |
+**2. Small records with batching: Kafka is about 9× faster, because StormLog's client doesn't batch.**
+Same configurations as scenario 1. Kafka's producer packs hundreds of small records into one
+request; StormLog's sends one record per request. This is the client's biggest gap.
+
+| Record size | StormLog | Kafka (batched) |
+|---|---|---|
+| 64 B | 54K rec/s | 479K rec/s |
+| 256 B | 53K rec/s | 370K rec/s |
+| 1 KB | 48K rec/s | 132K rec/s |
+
+**3. Minimum-latency configuration (no batching on either side): StormLog has sub-millisecond p99.**
+Kafka with `batch.size=0`, `linger.ms=0`; both at a fixed 5,000 records/s for 60 s per size, so
+neither is saturated and producer startup is under 1% of samples. Latency is measured by each
+client from send to acknowledgment; Kafka's tool reports whole milliseconds. No production
+Kafka deployment runs unbatched, so this shows per-request path cost, not typical Kafka latency.
+
+| Record size | StormLog p50 / p99 | Kafka, batching off, p50 / p99 |
 |---|---|---|
 | 64 B | 0.07 / 0.18 ms | 1 / 8 ms |
 | 256 B | 0.07 / 0.30 ms | 1 / 18 ms |
@@ -101,21 +117,13 @@ durability (both systems' default), 5 requests in flight. Produced by
 | 4 KB | 0.08 / 0.59 ms | 1 / 21 ms |
 | 16 KB | 0.06 / 0.83 ms | 0 / 16 ms |
 
-**How to read this, without spin:**
+At maximum rate with batching off on both sides, StormLog also does about
+2.2× Kafka's record rate (it does less per request: no record-batch format, CRC or batch
+headers).
 
-- **Record at a time, StormLog is about 2× faster** than Kafka with batching off: it does less
-  per request (no record-batch format, no CRC, no per-batch headers) and its tail latency at a
-  fixed rate is sub-millisecond. Kafka's perf tool reports whole milliseconds, so its p50 of
-  0–1 ms is a resolution floor, but its p99 of 8–21 ms is real.
-- **Kafka with its default batching wins decisively for small records**: about 9× StormLog's
-  throughput at 64 B, using a fraction of the CPU per record (the bottom-left panel). Batching is
-  the single most important thing StormLog's client lacks.
-- **From about 4 KB up, batching stops mattering** (a 16 KB batch holds one 16 KB record), and
-  StormLog matches or beats Kafka on MB/s.
-- **Disk writes per payload byte are the same** for both (about 1.0 at ≥ 1 KB, rising for tiny
-  records because of per-record framing and index overhead).
-- Caveats: one machine, loopback networking, macOS. Kafka is tuned for Linux and real networks;
-  replication (Kafka's real durability story) is off for both.
+Disk writes per payload byte are the same for both (about 1.0 at ≥ 1 KB). Caveats: one
+machine, loopback, macOS; Kafka is tuned for Linux and real networks. Both run without
+replication in this comparison.
 
 ## What's different from Kafka
 

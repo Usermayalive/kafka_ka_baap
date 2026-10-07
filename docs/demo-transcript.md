@@ -80,11 +80,11 @@ this is the shot list the script was built around:
 | Time | Shot | Command |
 |---|---|---|
 | 0:00 | Architecture diagram (README) and what's being shown | — |
-| 0:30 | Start the cluster; show the quorum | `./scripts/demo-cluster.sh` (or `docker compose up -d`) |
+| 0:30 | Start the cluster; show the quorum | `./scripts/demo-cluster.sh` |
 | 1:00 | Topic layout, produce, group consume | (script) |
 | 1:45 | Poison pill routed to the DLQ, consumer keeps going | (script) |
 | 2:15 | `kill -9` the controller: new leader, partition offline, others still accepting writes | (script) |
 | 3:00 | Restart: re-registration, partition back online with its data | (script) |
-| 3:30 | Metrics in Prometheus: `stormlog_topic_records_in_total`, `stormlog_group_lag_records` | `docker compose` stack, http://localhost:9090 |
+| 3:30 | Metrics: `stormlog_topic_records_in_total`, `stormlog_group_lag_records` | `curl localhost:20092/metrics` (point any Prometheus at it) |
 | 4:00 | GDPR: register a PII schema, produce, `forget-entity`, fetch shows `[REDACTED]` | `StormLogCli ... forget-entity u-123` |
 | 4:30 | Benchmark chart vs Kafka and how to read it | README |
