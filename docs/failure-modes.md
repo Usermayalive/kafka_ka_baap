@@ -36,7 +36,8 @@ Durability semantics are in [durability.md](durability.md); erasure semantics ar
 | Producer retry of an acknowledged request | Sequence within the 5-entry window | Original offset returned, no duplicate append | — | `Phase3…Test` (duplicate cases) |
 | Sequence gap (lost request) | `seq > last + 1` | `OUT_OF_ORDER_SEQUENCE` | Producer bumps its epoch (resets to 0) | `Phase3…Test` |
 | Zombie producer (old epoch) | `epoch < current` | `PRODUCER_FENCED` | — | `Phase3…Test` |
-| Broker crash: producer state loss window | Restored from `.producer_state` (every 100 sequences) | Up to 99 recent sequences forgotten: a retry in that window can be **duplicated**, never lost | Producer epoch bump on `OUT_OF_ORDER` | Snapshot restore tested; window documented |
+| Broker crash, RF = 1: producer state loss window | Restored from `.producer_state` (every 100 sequences) | Up to 99 recent sequences forgotten: a retry in that window can be **duplicated**, never lost | Producer epoch bump on `OUT_OF_ORDER` | Snapshot restore tested; window documented |
+| Leader crash, RF ≥ 2: idempotent producer retries in-flight batches | New leader holds replicated producer state consistent with its log | None: retries of batches it has are deduplicated, the rest append once | Automatic | `testIdempotentBatchingProducerSurvivesLeaderCrashWithoutDuplicates` |
 | One client pipelines faster than the broker processes | Per-connection queue ≥ 256 | Broker stops reading the socket; TCP backpressure blocks the client | Resumes at ≤ 64 queued | `ConnectionBackpressureTest` |
 | Shared worker pool saturated | `RejectedExecutionException` | `BROKER_OVERLOADED`, exactly one response per request | Client retry | `ConnectionBackpressureTest.testRejectedTaskNeverRuns` |
 | Client exceeds quota | Token bucket | `QUOTA_EXCEEDED` with a throttle hint | Client backs off | `Phase3…Test` |

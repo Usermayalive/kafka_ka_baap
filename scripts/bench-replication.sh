@@ -27,11 +27,12 @@ sleep 3 # followers start fetching
 perf() { java -cp "$JAR" com.simplekafka.cli.StormLogPerf "$HOST:29192" "$@" 2>/dev/null; }
 mkdir -p "$(dirname "$OUT")"
 echo "config,records,record_size,seconds,records_per_sec,mb_per_sec,p50_ms,p99_ms,errors,rate" > "$OUT"
-run() { # label topic acks
-  perf "$2" 50000 1024 5 plain 0 "$3" >/dev/null # warmup
-  echo "$1,$(perf "$2" 200000 1024 5 plain 0 "$3"),max" | tee -a "$OUT"
-  echo "$1,$(perf "$2" 150000 1024 5 plain 5000 "$3"),5000" | tee -a "$OUT"
+run() { # label topic acks [mode]
+  perf "$2" 50000 1024 5 "${4:-plain}" 0 "$3" >/dev/null # warmup
+  echo "$1,$(perf "$2" 200000 1024 5 "${4:-plain}" 0 "$3"),max" | tee -a "$OUT"
+  echo "$1,$(perf "$2" 150000 1024 5 "${4:-plain}" 5000 "$3"),5000" | tee -a "$OUT"
 }
 run "RF=1 acks=1" rf1 1
 run "RF=3 acks=1" rf3 1
 run "RF=3 acks=all" rf3 all
+run "RF=3 acks=all batched" rf3 all batched

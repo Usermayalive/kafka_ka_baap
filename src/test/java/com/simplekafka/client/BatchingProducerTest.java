@@ -85,6 +85,30 @@ public class BatchingProducerTest {
     }
 
     @Test
+    void testFastProducerKeepsBatchesBoundedAndEverySendSucceeds() throws Exception {
+        broker.getMetrics(); // quotas: NettyBrokerServer default allows 50 MB/s per client
+        byte[] record = new byte[1024];
+        List<CompletableFuture<Long>> futures = new ArrayList<>();
+        try (BatchingProducer producer = new BatchingProducer(client, BatchingProducer.Config.defaults()
+                .withAcks(KafkaFrame.ACKS_LEADER))) {
+            for (int i = 0; i < 40_000; i++) { // 40 MB: unbounded batches would exceed the 16 MB frame limit
+                futures.add(producer.send("events", 0, record));
+            }
+            producer.flush();
+        }
+        int failed = 0;
+        for (CompletableFuture<Long> f : futures) {
+            if (f.isCompletedExceptionally()) {
+                failed++;
+            }
+        }
+        assertEquals(0, failed, "Every send succeeds");
+        assertEquals(40_000, partition.getNextOffset());
+        long requests = produceBatchRequests();
+        assertTrue(requests >= 40_000 * 1028L / 16_384, "Batches stay near batchBytes (" + requests + " requests)");
+    }
+
+    @Test
     void testLingerBoundsLatencyOfALoneRecord() throws Exception {
         try (BatchingProducer producer = new BatchingProducer(client, BatchingProducer.Config.defaults()
                 .withBatching(16_384, 20))) {

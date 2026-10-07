@@ -54,6 +54,9 @@ A recorded run of the demo is in [`docs/demo-transcript.md`](docs/demo-transcrip
 S3 tiering is tested against [SeaweedFS](https://github.com/seaweedfs/seaweedfs)'s S3 API
 (MinIO's community binaries are no longer distributed); any S3-compatible endpoint works.
 
+Clients: `SimpleKafkaClient` (one record per request), `BatchingProducer` (Kafka-style batching,
+optionally idempotent), `GroupConsumer` (consumer groups).
+
 CLI: `java -cp target-cli/simple-kafka-1.0-SNAPSHOT.jar com.simplekafka.cli.StormLogCli --bootstrap HOST:PORT <command>`
 with `describe`, `create-topic`, `produce`, `produce-batch`, `consume`, `consume-group`,
 `consume-with-dlq`, `commit`, `forget-entity`.
@@ -181,14 +184,12 @@ replication in this comparison.
 | Tiered storage for compacted topics | Compaction rewrites history that's already in S3 | Compacted topics stay local (Kafka has the same limit) |
 | TLS, authentication, ACLs | Out of scope for a storage/coordination project | Run only on a trusted network |
 | Transactions / exactly-once across partitions | Needs a transaction coordinator and markers in the log | Idempotence is per producer session and partition |
-| Producer-side batching | The client sends one record per request | Kafka is much faster for small records (see benchmarks) |
 
 ## Known limitations
 
 - **Group lag is partial.** A group's coordinator reports lag only for partitions it hosts.
 - **No preferred-leader rebalancing.** After a failover, leadership stays where it moved, so it can concentrate on fewer brokers.
 - **One replica fetch per partition** rather than one batched fetch per broker pair (Kafka's design); fine at demo scale, wasteful with thousands of partitions.
-- **Idempotent producer state isn't replicated** (the log format carries no producer IDs): after a failover the producer re-initializes, and an in-flight retry may be duplicated.
 - **Combined-mode controller.** Every broker runs a quorum member, so losing the controller also loses its partition leaderships for one election plus the session timeout (see [failure modes](docs/failure-modes.md#correlated-failure-the-controller-also-leads-partitions)); production would use dedicated controller nodes.
 
 ## Bugs found and fixed along the way
@@ -212,6 +213,8 @@ Each was found by measuring or by a test written to break the feature, and each 
 | Erasure missed by a broker catching up from a Raft snapshot; raw entity IDs in the Raft log | A "forgotten" person's data still readable; their identifier persisted forever |
 | ISR "caught up" compared against the leader's *current* log end | Healthy followers evicted from the ISR under steady writes, leaving no failover candidate |
 | Wrapped data keys were per broker | After a failover the new leader could not decrypt PII it held |
+| Idempotent producer state lived only on the leader | An idempotent producer lost 2,899 of 3,000 sends across a leader crash (the new leader rejected its sequences) |
+| The HW advanced only on follower fetches; replica fetches shared one connection | `acks=all` waited on unrelated long-polls; lagging followers took 40 minutes to catch up |
 | Restart races: heartbeats started after the registration had been applied, registration gave up after one timeout, watch callbacks blocked metadata notifications | A restarted broker could be fenced again, or stay unregistered or with a stale view of the cluster forever |
 | An IDE compiling into `target/` emitted class files for code that didn't compile | Maven reported success on broken code (hence `-Dbuild.dir`) |
 

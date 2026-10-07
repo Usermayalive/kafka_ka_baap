@@ -65,9 +65,10 @@ public class BatchingProducer implements AutoCloseable {
         }
     }
 
-    /** Per-partition state: the open batch, sequence numbers, and (idempotent) the in-flight flag. */
+    /** Per-partition state: the open batch, closed batches waiting to ship, sequence numbers, in-flight flag. */
     private static final class Accumulator {
         Batch open;
+        final ArrayDeque<Batch> ready = new ArrayDeque<>();
         int nextSequence;
         boolean batchInFlight;
         final ArrayDeque<Batch> retries = new ArrayDeque<>();
@@ -80,6 +81,9 @@ public class BatchingProducer implements AutoCloseable {
     private final Map<TopicPartition, Accumulator> accumulators = new ConcurrentHashMap<>();
     private final Semaphore inFlight;
     private final AtomicInteger outstanding = new AtomicInteger(); // records accepted but not completed
+    /** Bytes buffered but not yet acknowledged; send() blocks above this (Kafka's buffer.memory). */
+    static final long BUFFER_MEMORY = 32L * 1024 * 1024;
+    private final java.util.concurrent.atomic.AtomicLong bufferedBytes = new java.util.concurrent.atomic.AtomicLong();
     private final Object wake = new Object();
     private final Thread sender;
     private volatile boolean running = true;
@@ -106,17 +110,33 @@ public class BatchingProducer implements AutoCloseable {
         }
         TopicPartition tp = new TopicPartition(topic, partition);
         Accumulator acc = accumulators.computeIfAbsent(tp, k -> new Accumulator());
+        // Backpressure: block the caller instead of buffering without bound
+        while (bufferedBytes.get() > BUFFER_MEMORY && running) {
+            synchronized (wake) {
+                try {
+                    wake.wait(1);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return CompletableFuture.failedFuture(e);
+                }
+            }
+        }
         CompletableFuture<Long> future = new CompletableFuture<>();
-        boolean full;
+        boolean full = false;
         synchronized (acc) {
+            if (acc.open != null && acc.open.bytes + value.length + 4 > config.batchBytes() && !acc.open.records.isEmpty()) {
+                acc.ready.add(acc.open); // close the full batch; this record starts the next one
+                acc.open = null;
+                full = true;
+            }
             if (acc.open == null) {
                 acc.open = new Batch(tp);
             }
             acc.open.records.add(value);
             acc.open.futures.add(future);
             acc.open.bytes += value.length + 4;
-            full = acc.open.bytes >= config.batchBytes();
         }
+        bufferedBytes.addAndGet(value.length + 4);
         outstanding.incrementAndGet();
         if (full) {
             synchronized (wake) {
@@ -131,7 +151,8 @@ public class BatchingProducer implements AutoCloseable {
         for (Accumulator acc : accumulators.values()) {
             synchronized (acc) {
                 if (acc.open != null) {
-                    acc.open.deadlineNanos = -1; // ship now regardless of linger
+                    acc.ready.add(acc.open); // ship now regardless of linger
+                    acc.open = null;
                 }
             }
         }
@@ -155,10 +176,16 @@ public class BatchingProducer implements AutoCloseable {
                     }
                     if (!acc.retries.isEmpty()) {
                         ready = acc.retries.poll();
-                    } else if (acc.open != null && (acc.open.bytes >= config.batchBytes() || acc.open.deadlineNanos < 0
-                            || now - acc.open.createdNanos >= TimeUnit.MILLISECONDS.toNanos(config.lingerMs()))) {
-                        ready = acc.open;
-                        acc.open = null;
+                    } else {
+                        if (!acc.ready.isEmpty()) {
+                            ready = acc.ready.poll();
+                        } else if (acc.open != null && (acc.open.bytes >= config.batchBytes() || acc.open.deadlineNanos < 0
+                                || now - acc.open.createdNanos >= TimeUnit.MILLISECONDS.toNanos(config.lingerMs()))) {
+                            ready = acc.open;
+                            acc.open = null;
+                        }
+                    }
+                    if (ready != null && ready.deadlineNanos <= 0) { // first send of this batch (not a retry)
                         ready.deadlineNanos = now + TimeUnit.MILLISECONDS.toNanos(config.deliveryTimeoutMs());
                         if (config.idempotent()) {
                             ready.baseSequence = acc.nextSequence; // fixed for every retry of this batch
@@ -271,6 +298,7 @@ public class BatchingProducer implements AutoCloseable {
         synchronized (acc) {
             acc.batchInFlight = false;
         }
+        bufferedBytes.addAndGet(-batch.bytes);
         outstanding.addAndGet(-batch.futures.size());
         inFlight.release();
         synchronized (wake) {
