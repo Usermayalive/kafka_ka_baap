@@ -161,6 +161,8 @@
                     <argLine>--enable-native-access=ALL-UNNAMED</argLine>
                     <systemPropertyVariables>
                         <stormlog.data.dir>${project.build.directory}/test-kafka-data</stormlog.data.dir>
+                        <!-- Faster ISR shrink in tests (default 10 s) -->
+                        <stormlog.replica.lag.max.ms>2000</stormlog.replica.lag.max.ms>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>

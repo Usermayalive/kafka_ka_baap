@@ -31,7 +31,7 @@ public class CryptoShredder implements AutoCloseable {
     public static final String REDACTED = "[REDACTED]";
     private static final int DEK_CACHE_SIZE = 10_000;
 
-    private final DekStore store;
+    private final KeyStore store;
     private final MasterKeyProvider masterKeys;
     /** Replicated erasure count per entity key (0 = never erased). */
     private final ToIntFunction<String> erasureGeneration;
@@ -42,11 +42,11 @@ public class CryptoShredder implements AutoCloseable {
         }
     };
 
-    public CryptoShredder(DekStore store, MasterKeyProvider masterKeys) {
+    public CryptoShredder(KeyStore store, MasterKeyProvider masterKeys) {
         this(store, masterKeys, key -> 0);
     }
 
-    public CryptoShredder(DekStore store, MasterKeyProvider masterKeys, ToIntFunction<String> erasureGeneration) {
+    public CryptoShredder(KeyStore store, MasterKeyProvider masterKeys, ToIntFunction<String> erasureGeneration) {
         this.store = store;
         this.masterKeys = masterKeys;
         this.erasureGeneration = erasureGeneration;
@@ -146,8 +146,11 @@ public class CryptoShredder implements AutoCloseable {
                     return null;
                 }
             } else if (create) {
-                dek = AesGcm.newKey();
-                store.put(keyName, masterKeys.wrap(keyName, dek));
+                byte[] candidate = AesGcm.newKey();
+                byte[] ours = masterKeys.wrap(keyName, candidate);
+                byte[] stored = store.putIfAbsent(keyName, ours);
+                // Another broker may have created this key first: everyone uses the stored one
+                dek = stored == ours ? candidate : masterKeys.unwrap(keyName, stored);
             } else {
                 return null;
             }
@@ -166,5 +169,10 @@ public class CryptoShredder implements AutoCloseable {
     public void close() {
         store.close();
         masterKeys.close();
+    }
+
+    /** Closes the key store but keeps the master key provider (when replacing the store). */
+    public void closeStoreOnly() {
+        store.close();
     }
 }

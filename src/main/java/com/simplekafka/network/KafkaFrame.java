@@ -32,6 +32,7 @@ public class KafkaFrame {
     public static final short API_KEY_SET_SCHEMA_COMPATIBILITY = 14;
     public static final short API_KEY_GET_SCHEMA = 15;
     public static final short API_KEY_FORGET_ENTITY = 16;
+    public static final short API_KEY_REPLICA_FETCH = 17;
 
     // Error Codes
     public static final short ERROR_NONE = 0;
@@ -52,6 +53,12 @@ public class KafkaFrame {
     public static final short ERROR_SCHEMA_VIOLATION = 1014;
     public static final short ERROR_INCOMPATIBLE_SCHEMA = 1015;
     public static final short ERROR_SCHEMA_NOT_FOUND = 1016;
+    public static final short ERROR_NOT_ENOUGH_REPLICAS = 1017;
+    public static final short ERROR_REQUEST_TIMED_OUT = 1018;
+
+    /** Produce acks: leader-only (written locally) or all in-sync replicas. */
+    public static final byte ACKS_LEADER = 1;
+    public static final byte ACKS_ALL = -1;
 
     /** Produce with this producer ID to bypass idempotence (Kafka's NO_PRODUCER_ID). */
     public static final long NO_PRODUCER_ID = -1L;

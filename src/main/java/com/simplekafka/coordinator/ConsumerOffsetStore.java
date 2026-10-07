@@ -59,7 +59,16 @@ public class ConsumerOffsetStore {
         ensureLoaded(p, log);
         String key = key(group, topic, partition);
         OffsetAndMetadata value = new OffsetAndMetadata(offset, System.currentTimeMillis(), metadata == null ? "" : metadata);
-        log.append(encode(key, value));
+        long logOffset = log.append(encode(key, value));
+        // A commit is only acknowledged once every in-sync replica of the offsets partition has it
+        try {
+            if (!log.awaitHighWatermark(logOffset, 30_000)) {
+                throw new IOException("Offset commit for " + group + " not replicated within 30 s");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted waiting for offset commit replication", e);
+        }
         committed.put(key, value);
 
         if (commitsSinceCompaction.computeIfAbsent(p, k -> new AtomicLong()).incrementAndGet() >= COMPACT_EVERY_COMMITS) {
@@ -102,6 +111,14 @@ public class ConsumerOffsetStore {
                     LOGGER.log(Level.WARNING, "Failed to load " + TOPIC + "-" + p, e);
                 }
             }
+        }
+    }
+
+    /** Forget the cached view of one offsets partition; rebuilt from its log on next use (new leader). */
+    public void invalidate(int offsetsPartition) {
+        synchronized (loaded) {
+            loaded.remove(offsetsPartition);
+            committed.keySet().removeIf(key -> partitionFor(key.substring(0, key.indexOf('\u0000'))) == offsetsPartition);
         }
     }
 

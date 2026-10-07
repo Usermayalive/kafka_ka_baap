@@ -7,7 +7,9 @@ import com.simplekafka.coordinator.GroupCoordinator;
 import com.simplekafka.gdpr.CryptoShredder;
 import com.simplekafka.gdpr.DekStore;
 import com.simplekafka.gdpr.EnvMasterKeyProvider;
+import com.simplekafka.gdpr.KeyStore;
 import com.simplekafka.gdpr.KmsMasterKeyProvider;
+import com.simplekafka.gdpr.ReplicatedKeyStore;
 import com.simplekafka.gdpr.MasterKeyProvider;
 import com.simplekafka.metadata.MetadataCommand;
 import com.simplekafka.metadata.MetadataImage;
@@ -77,6 +79,8 @@ public class SimpleKafkaBroker {
      * every earlier erasure, leadership change and schema before serving produce or fetch.
      */
     private volatile boolean servingReady = true;
+    private volatile ReplicaManager replicaManager;
+    private volatile int minInsyncReplicas = Integer.getInteger("stormlog.min.insync.replicas", 1);
     /**
      * Metadata watch callbacks run here, one at a time, never on the metadata-notifier thread:
      * controller reactions make blocking Raft writes, which must not stall later notifications.
@@ -142,6 +146,13 @@ public class SimpleKafkaBroker {
         zkClient = new MetadataLog(new MetadataQuorum(self, voters, joinQuorumAsLearner,
                 new File(dataDir(), "__metadata"), MetadataQuorum.DEFAULT_SESSION_TIMEOUT_MS));
         zkClient.connect();
+        installShredder(); // switch to replicated data keys now that the quorum is up
+        replicaManager = new ReplicaManager(this);
+        replicaManager.onBecomeLeader(tp -> {
+            if (tp.topic().equals(ConsumerOffsetStore.TOPIC)) {
+                offsetStore.invalidate(tp.partition()); // rebuild from the replicated log we now lead
+            }
+        });
         zkClient.onPartitionStateChange(() -> controllerEvents.execute(this::reloadAllTopics));
         zkClient.quorum().stateMachine().onCommand(this::onMetadataCommand);
         zkClient.quorum().stateMachine().onChange(change -> {
@@ -169,6 +180,9 @@ public class SimpleKafkaBroker {
             }
             groupCoordinator.close();
             controllerEvents.shutdownNow();
+            if (replicaManager != null) {
+                replicaManager.close();
+            }
             if (zkClient != null) {
                 zkClient.close();
             }
@@ -336,6 +350,10 @@ public class SimpleKafkaBroker {
             List<Integer> availableBrokers = new ArrayList<>(zkClient != null
                     ? zkClient.image().brokers().keySet() : clusterMetadata.keySet());
             java.util.Collections.sort(availableBrokers);
+            if (replicationFactor > availableBrokers.size()) {
+                throw new IllegalArgumentException("Replication factor " + replicationFactor + " exceeds the "
+                        + availableBrokers.size() + " live broker(s)");
+            }
             if (availableBrokers.isEmpty()) {
                 availableBrokers.add(brokerId);
             }
@@ -478,6 +496,9 @@ public class SimpleKafkaBroker {
             for (String topic : zkClient.getChildren("/topics")) {
                 loadTopic(topic);
             }
+            if (replicaManager != null) {
+                replicaManager.onMetadataUpdate(zkClient.image());
+            }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to reload topic metadata", e);
         }
@@ -488,9 +509,9 @@ public class SimpleKafkaBroker {
 
     /**
      * Controller: keep partition leadership on live brokers. A partition whose leader is gone
-     * fails over to a live in-sync replica; with no replication that set is just the old leader,
-     * so the partition goes offline (leader -1) until its broker returns, and is then re-elected.
-     * Electing an out-of-sync replica would silently lose the partition's data.
+     * fails over to a live in-sync replica. If no in-sync replica is alive the partition goes
+     * offline (leader -1) until one returns: electing an out-of-sync replica ("unclean" election)
+     * would silently lose committed records.
      */
     private synchronized void rebalancePartitions() {
         if (!isController.get() || zkClient == null) {
@@ -504,7 +525,13 @@ public class SimpleKafkaBroker {
                 boolean leaderAlive = state.leader() >= 0 && alive.contains(state.leader());
                 if (!leaderAlive && desired != state.leader()) {
                     try {
-                        zkClient.electLeader(topic.name(), i, desired);
+                        if (desired >= 0) {
+                            // Only in-sync replicas are eligible, so every committed record survives
+                            List<Integer> isr = state.isr().stream().filter(alive::contains).toList();
+                            zkClient.electLeader(topic.name(), i, desired, isr);
+                        } else {
+                            zkClient.electLeader(topic.name(), i, desired); // keep the ISR: wait for it to return
+                        }
                         LOGGER.info("Partition " + topic.name() + "-" + i + " leader " + state.leader() + " -> " + desired
                                 + (desired < 0 ? " (offline: no live in-sync replica)" : ""));
                     } catch (Exception e) {
@@ -523,6 +550,20 @@ public class SimpleKafkaBroker {
 
     public MetadataLog getMetadataLog() {
         return zkClient;
+    }
+
+    /** Null when running without a metadata quorum (standalone: no replication). */
+    public ReplicaManager getReplicaManager() {
+        return replicaManager;
+    }
+
+    /** acks=all produces are rejected while a partition has fewer in-sync replicas than this. */
+    public int getMinInsyncReplicas() {
+        return minInsyncReplicas;
+    }
+
+    public void setMinInsyncReplicas(int minInsyncReplicas) {
+        this.minInsyncReplicas = minInsyncReplicas;
     }
 
     public MetadataImage metadataImage() {
@@ -592,9 +633,29 @@ public class SimpleKafkaBroker {
         return schemaService;
     }
 
-    /** Enables PII field encryption with wrapped per-entity keys in this broker's local key store. */
+    private volatile MasterKeyProvider masterKeys;
+
+    /**
+     * Enables PII field encryption. With a metadata quorum, wrapped data keys are replicated
+     * through Raft so every replica (and any future leader) can decrypt; standalone, they live in
+     * a local RocksDB store. Every broker must use the same master key provider/key.
+     */
     public void enableCryptoShredding(MasterKeyProvider masterKeys) throws IOException {
-        schemaService.setShredder(new CryptoShredder(new DekStore(new File(dataDir(), "__dek_store")), masterKeys,
+        this.masterKeys = masterKeys;
+        installShredder();
+    }
+
+    private void installShredder() throws IOException {
+        if (masterKeys == null) {
+            return;
+        }
+        CryptoShredder previous = schemaService.shredder();
+        if (previous != null) {
+            previous.closeStoreOnly();
+        }
+        DekStore local = new DekStore(new File(dataDir(), "__dek_store"));
+        KeyStore keys = zkClient == null ? local : new ReplicatedKeyStore(this::metadataImage, this::applyMetadata, local);
+        schemaService.setShredder(new CryptoShredder(keys, masterKeys,
                 entityKey -> metadataImage().erasureGeneration(entityKey)));
         reconcileForgottenEntities();
     }
@@ -654,6 +715,9 @@ public class SimpleKafkaBroker {
             adminServer.close();
         }
         groupCoordinator.close();
+        if (replicaManager != null) {
+            replicaManager.close();
+        }
         zkClient.quorum().close();
     }
 
@@ -847,7 +911,9 @@ public class SimpleKafkaBroker {
                 }
             }
             if (attempt == 0 && canCreateTopics()) {
-                createTopic(ConsumerOffsetStore.TOPIC, ConsumerOffsetStore.PARTITIONS, (short) 1);
+                // Replicated like any topic, so group coordination fails over with its partition
+                createTopic(ConsumerOffsetStore.TOPIC, ConsumerOffsetStore.PARTITIONS,
+                        (short) Math.min(3, liveBrokers().size()));
             } else {
                 break;
             }

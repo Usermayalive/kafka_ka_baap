@@ -97,8 +97,9 @@ public class MetadataLog {
             int leader = s.get("leader").getAsInt();
             List<Integer> replicas = new ArrayList<>();
             s.getAsJsonArray("replicas").forEach(r -> replicas.add(r.getAsInt()));
-            // No replication: only the leader holds the data, so it is the only in-sync replica
-            partitions.add(new MetadataImage.PartitionState(leader, replicas, List.of(leader), 0));
+            List<Integer> isr = new ArrayList<>(); // a new topic's replicas are all empty, hence in sync
+            s.getAsJsonArray("isr").forEach(r -> isr.add(r.getAsInt()));
+            partitions.add(new MetadataImage.PartitionState(leader, replicas, isr, 0));
         }
         pendingTopicConfigs.remove(topic);
         pendingPartitionStates.remove(topic);
@@ -212,8 +213,15 @@ public class MetadataLog {
         quorum.submit(MetadataCommand.electLeader(topic, partition, leader));
     }
 
-    public void updateIsr(String topic, int partition, List<Integer> isr) throws IOException {
-        quorum.submit(MetadataCommand.updateIsr(topic, partition, isr));
+    public void updateIsr(String topic, int partition, int leader, List<Integer> isr) throws IOException {
+        quorum.submit(MetadataCommand.updateIsr(topic, partition, leader, isr));
+    }
+
+    /** Elects {@code leader} and sets the ISR in one step (the controller's failover). */
+    public void electLeader(String topic, int partition, int leader, List<Integer> isr) throws IOException {
+        MetadataCommand c = MetadataCommand.electLeader(topic, partition, leader);
+        c.isr = isr;
+        quorum.submit(c);
     }
 
     /** Graceful shutdown: unregister (as closing a ZooKeeper session deleted ephemeral nodes). */

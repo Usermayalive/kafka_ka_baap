@@ -40,6 +40,8 @@ public class MetadataImage {
      * broker catching up from one still learns of erasures it never saw as commands.
      */
     private final TreeMap<String, Integer> erasures = new TreeMap<>();
+    /** keyName (entityKey-gGEN) -> base64 wrapped DEK, shared by every replica. */
+    private final TreeMap<String, String> wrappedDeks = new TreeMap<>();
 
     /** Applies a command; returns what changed, or throws IllegalStateException if rejected. */
     public synchronized Change apply(MetadataCommand c) {
@@ -67,6 +69,13 @@ public class MetadataImage {
             case UPDATE_ISR -> {
                 TopicImage t = topic(c.topic);
                 PartitionState p = t.partitions().get(c.partition);
+                if (c.leader != null && c.leader != p.leader()) {
+                    throw new IllegalStateException("ISR change from " + c.leader + " rejected: leader of "
+                            + c.topic + "-" + c.partition + " is " + p.leader());
+                }
+                if (!c.isr.contains(p.leader())) {
+                    throw new IllegalStateException("ISR must contain the leader " + p.leader());
+                }
                 replacePartition(t, c.partition, new PartitionState(p.leader(), p.replicas(), List.copyOf(c.isr), p.leaderEpoch()));
                 return Change.PARTITION_STATE;
             }
@@ -76,7 +85,10 @@ public class MetadataImage {
                 if (p.leader() == c.leader) {
                     return Change.NONE;
                 }
-                replacePartition(t, c.partition, new PartitionState(c.leader, p.replicas(), p.isr(), p.leaderEpoch() + 1));
+                // A new leader starts with an ISR of what the controller knows is in sync and alive;
+                // the leader re-expands it as followers catch up
+                List<Integer> isr = c.isr != null ? List.copyOf(c.isr) : p.isr();
+                replacePartition(t, c.partition, new PartitionState(c.leader, p.replicas(), isr, p.leaderEpoch() + 1));
                 return Change.PARTITION_STATE;
             }
             case REGISTER_SCHEMA -> {
@@ -109,7 +121,18 @@ public class MetadataImage {
             }
             case FORGET_ENTITY -> {
                 erasures.merge(c.entityKey, 1, Integer::sum);
+                // Destroy every existing generation's wrapped key: it leaves the image and snapshots
+                wrappedDeks.keySet().removeIf(name -> name.startsWith(c.entityKey + "-g"));
                 return Change.ENTITY_FORGOTTEN;
+            }
+            case CREATE_DEK -> {
+                String entityKey = c.keyName.substring(0, c.keyName.lastIndexOf("-g"));
+                int generation = Integer.parseInt(c.keyName.substring(c.keyName.lastIndexOf("-g") + 2));
+                if (generation < erasures.getOrDefault(entityKey, 0)) {
+                    throw new IllegalStateException("Data key " + c.keyName + " belongs to an erased generation");
+                }
+                wrappedDeks.putIfAbsent(c.keyName, c.wrappedDek); // first proposal wins
+                return Change.NONE;
             }
             case SET_SCHEMA_COMPATIBILITY -> {
                 try {
@@ -170,6 +193,11 @@ public class MetadataImage {
         return erasures.getOrDefault(entityKey, 0);
     }
 
+    public synchronized byte[] wrappedDek(String keyName) {
+        String encoded = wrappedDeks.get(keyName);
+        return encoded == null ? null : java.util.Base64.getDecoder().decode(encoded);
+    }
+
     public synchronized Map<String, Integer> erasures() {
         return new TreeMap<>(erasures);
     }
@@ -213,11 +241,11 @@ public class MetadataImage {
 
     private record Snapshot(List<BrokerRegistration> brokers, List<TopicImage> topics,
                             Map<String, List<SchemaVersion>> schemas, Map<String, String> schemaCompatibility,
-                            int nextSchemaId, Map<String, Integer> erasures) {}
+                            int nextSchemaId, Map<String, Integer> erasures, Map<String, String> wrappedDeks) {}
 
     public synchronized String toJson() {
         return GSON.toJson(new Snapshot(new ArrayList<>(brokers.values()), new ArrayList<>(topics.values()),
-                schemas, schemaCompatibility, nextSchemaId, erasures));
+                schemas, schemaCompatibility, nextSchemaId, erasures, wrappedDeks));
     }
 
     public synchronized void loadJson(String json) {
@@ -238,6 +266,10 @@ public class MetadataImage {
         erasures.clear();
         if (s.erasures() != null) {
             erasures.putAll(s.erasures());
+        }
+        wrappedDeks.clear();
+        if (s.wrappedDeks() != null) {
+            wrappedDeks.putAll(s.wrappedDeks());
         }
     }
 }

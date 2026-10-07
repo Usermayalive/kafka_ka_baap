@@ -121,6 +121,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             case KafkaFrame.API_KEY_SET_SCHEMA_COMPATIBILITY -> "set_schema_compatibility";
             case KafkaFrame.API_KEY_GET_SCHEMA -> "get_schema";
             case KafkaFrame.API_KEY_FORGET_ENTITY -> "forget_entity";
+            case KafkaFrame.API_KEY_REPLICA_FETCH -> "replica_fetch";
             default -> "unknown"; // bounded: never the raw key
         };
     }
@@ -156,6 +157,12 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                 return handleGetSchema(frame);
             case KafkaFrame.API_KEY_FORGET_ENTITY:
                 return handleForgetEntity(frame);
+            case KafkaFrame.API_KEY_REPLICA_FETCH:
+                if (broker.getReplicaManager() == null) {
+                    return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_LEADER,
+                            "Replication is not running on this broker");
+                }
+                return broker.getReplicaManager().handleReplicaFetch(frame);
             default:
                 return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(),
                         KafkaFrame.ERROR_CORRUPT_MESSAGE, "Unknown apiKey: " + frame.getApiKey());
@@ -189,6 +196,8 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         int msgLen = dis.readInt();
         byte[] message = new byte[msgLen];
         dis.readFully(message);
+        // Optional trailing acks byte; older clients omit it and get leader-only acks
+        byte acks = dis.available() > 0 ? dis.readByte() : KafkaFrame.ACKS_LEADER;
 
         // 1. Enforce Client Rate Quotas
         try {
@@ -217,8 +226,19 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                     sve.getMessage());
         }
         broker.getMetrics().recordProduce(topic, stored.length);
+        if (acks == KafkaFrame.ACKS_ALL) {
+            java.util.Set<Integer> isr = broker.getReplicaManager() == null ? null
+                    : broker.getReplicaManager().isrOf(topic, partitionId);
+            if (isr != null && isr.size() < broker.getMinInsyncReplicas()) {
+                return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_ENOUGH_REPLICAS,
+                        topic + "-" + partitionId + " has " + isr.size() + " in-sync replica(s) " + isr
+                                + "; acks=all needs at least " + broker.getMinInsyncReplicas());
+            }
+        }
         if (producerId == KafkaFrame.NO_PRODUCER_ID) {
-            return produceResponse(frame, topic, partitionId, partition.append(stored), false);
+            long offset = partition.append(stored);
+            KafkaFrame notReplicated = awaitReplication(frame, partition, offset, acks);
+            return notReplicated != null ? notReplicated : produceResponse(frame, topic, partitionId, offset, false);
         }
         idempotenceManager.registerPartitionDir(topic, partitionId, new File(partition.getBaseDir()));
 
@@ -231,7 +251,10 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
                     topic, partitionId, producerId, epoch, sequenceNumber, () -> partition.appendBuffered(stored)
             );
             partition.awaitDurable(result.offset());
-
+            KafkaFrame notReplicated = awaitReplication(frame, partition, result.offset(), acks);
+            if (notReplicated != null) {
+                return notReplicated;
+            }
             return produceResponse(frame, topic, partitionId, result.offset(), result.isDuplicate());
         } catch (ProducerFencedException pfe) {
             LOGGER.warning("Producer fenced: " + pfe.getMessage());
@@ -261,7 +284,9 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         if (notLeader != null) {
             return notLeader;
         }
-        List<Partition.Record> records = partition.readRecords(fetchOffset, maxBytes);
+        // Consumers only see committed records: below the high watermark (= log end if unreplicated)
+        long highWatermark = partition.getHighWatermark();
+        List<Partition.Record> records = partition.readRecords(fetchOffset, maxBytes, highWatermark);
 
         // [error][count]{[offset:8][len:4][payload]}[logEndOffset:8]
         // Offsets are explicit: compacted partitions have gaps.
@@ -275,7 +300,7 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
             dos.writeInt(payload.length);
             dos.write(payload);
         }
-        dos.writeLong(partition.getNextOffset());
+        dos.writeLong(highWatermark);
         dos.flush();
 
         return new KafkaFrame(frame.getApiKey(), frame.getApiVersion(), frame.getCorrelationId(), baos.toByteArray());
@@ -571,9 +596,28 @@ public class NettyServerHandler extends SimpleChannelInboundHandler<KafkaFrame> 
         return null;
     }
 
+    /** acks=all: wait until every in-sync replica has the record (the HW passes it). */
+    private KafkaFrame awaitReplication(KafkaFrame frame, Partition partition, long offset, byte acks) {
+        if (acks != KafkaFrame.ACKS_ALL) {
+            return null;
+        }
+        try {
+            if (partition.awaitHighWatermark(offset, 30_000)) {
+                return null;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        // Like Kafka: the record is in the leader's log and may still commit; the client retries
+        return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_REQUEST_TIMED_OUT,
+                "Offset " + offset + " not replicated to all in-sync replicas within 30 s");
+    }
+
     private KafkaFrame rejectIfNotCoordinator(KafkaFrame frame, String group) {
         int offsetsPartition = com.simplekafka.coordinator.ConsumerOffsetStore.partitionFor(group);
-        if (broker.hostedPartition(com.simplekafka.coordinator.ConsumerOffsetStore.TOPIC, offsetsPartition) == null) {
+        Partition offsetsLog = broker.hostedPartition(com.simplekafka.coordinator.ConsumerOffsetStore.TOPIC, offsetsPartition);
+        // A follower replica of the offsets partition is not the coordinator: only its leader is
+        if (offsetsLog == null || (offsetsLog.getLeader() > 0 && offsetsLog.getLeader() != broker.getBrokerId())) {
             return buildErrorFrame(frame.getApiKey(), frame.getCorrelationId(), KafkaFrame.ERROR_NOT_COORDINATOR,
                     "Broker " + broker.getBrokerId() + " is not the coordinator for group " + group);
         }

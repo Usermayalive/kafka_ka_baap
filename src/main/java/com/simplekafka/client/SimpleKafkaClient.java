@@ -116,8 +116,16 @@ public class SimpleKafkaClient implements AutoCloseable {
         throw new IOException("Failed to create topic " + topic + ": no broker accepted the request", last);
     }
 
-    /** Non-idempotent produce; see NettyIdempotentProducer for exactly-once-per-session semantics. */
+    /** Non-idempotent produce with acks=all; see NettyIdempotentProducer for per-session dedup. */
     public long send(String topic, int partition, byte[] message) throws IOException {
+        return send(topic, partition, message, KafkaFrame.ACKS_ALL);
+    }
+
+    /**
+     * @param acks {@link KafkaFrame#ACKS_ALL} (acknowledged once every in-sync replica has the
+     *             record: survives the leader's loss) or {@link KafkaFrame#ACKS_LEADER}
+     */
+    public long send(String topic, int partition, byte[] message, byte acks) throws IOException {
         byte[] request = payload(o -> {
             o.writeUTF(clientId);
             o.writeUTF(topic);
@@ -127,6 +135,7 @@ public class SimpleKafkaClient implements AutoCloseable {
             o.writeInt(0);
             o.writeInt(message.length);
             o.write(message);
+            o.writeByte(acks);
         });
         DataInputStream in = leaderRequest(topic, partition, KafkaFrame.API_KEY_PRODUCE, request);
         in.readUTF();

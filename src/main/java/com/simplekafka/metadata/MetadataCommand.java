@@ -21,7 +21,8 @@ public final class MetadataCommand {
         ELECT_LEADER,
         REGISTER_SCHEMA,
         SET_SCHEMA_COMPATIBILITY,
-        FORGET_ENTITY
+        FORGET_ENTITY,
+        CREATE_DEK
     }
 
     private static final Gson GSON = new Gson();
@@ -41,6 +42,9 @@ public final class MetadataCommand {
     public String compatibility;
     /** SHA-256 hex of the entity ID; the raw ID is never written to the Raft log. */
     public String entityKey;
+    public String keyName;
+    /** Base64 of a DEK wrapped by the master key provider (never a plaintext key). */
+    public String wrappedDek;
 
     private MetadataCommand(Type type) {
         this.type = type;
@@ -70,10 +74,12 @@ public final class MetadataCommand {
         return c;
     }
 
-    public static MetadataCommand updateIsr(String topic, int partition, List<Integer> isr) {
+    /** Proposed by the partition's leader; rejected unless {@code leader} still leads it (fencing). */
+    public static MetadataCommand updateIsr(String topic, int partition, int leader, List<Integer> isr) {
         MetadataCommand c = new MetadataCommand(Type.UPDATE_ISR);
         c.topic = topic;
         c.partition = partition;
+        c.leader = leader;
         c.isr = isr;
         return c;
     }
@@ -105,6 +111,14 @@ public final class MetadataCommand {
     public static MetadataCommand forgetEntity(String entityKey) {
         MetadataCommand c = new MetadataCommand(Type.FORGET_ENTITY);
         c.entityKey = entityKey;
+        return c;
+    }
+
+    /** Registers a wrapped data key cluster-wide; the first proposal for a key name wins. */
+    public static MetadataCommand createDek(String keyName, byte[] wrappedDek) {
+        MetadataCommand c = new MetadataCommand(Type.CREATE_DEK);
+        c.keyName = keyName;
+        c.wrappedDek = java.util.Base64.getEncoder().encodeToString(wrappedDek);
         return c;
     }
 

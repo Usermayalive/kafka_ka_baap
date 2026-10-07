@@ -12,7 +12,7 @@ import java.nio.charset.StandardCharsets;
  * compaction so the wrapped DEK doesn't linger in SST files longer than necessary (backups and
  * already-copied files are a different matter; see the threat model).
  */
-public class DekStore implements AutoCloseable {
+public class DekStore implements KeyStore {
     static {
         RocksDB.loadLibrary();
     }
@@ -56,6 +56,16 @@ public class DekStore implements AutoCloseable {
         } catch (RocksDBException e) {
             throw new IOException(e);
         }
+    }
+
+    @Override
+    public synchronized byte[] putIfAbsent(String keyName, byte[] wrappedDek) throws IOException {
+        byte[] existing = get(keyName);
+        if (existing != null) {
+            return existing;
+        }
+        put(keyName, wrappedDek);
+        return wrappedDek;
     }
 
     public void delete(String entityId) throws IOException {
