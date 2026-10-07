@@ -1,7 +1,8 @@
 # StormLog: a Kafka-style log broker, built from scratch in Java
 
-StormLog is a partitioned, append-only log broker in Java 25: segmented storage with group
-commit and crash recovery, a pipelined binary protocol on Netty, idempotent producers, consumer
+StormLog is a replicated, partitioned, append-only log broker in Java 25: segmented storage with
+group commit and crash recovery, leader–follower replication with an ISR, high watermark and
+leader-epoch truncation, a pipelined binary protocol on Netty, idempotent producers, consumer
 groups with cooperative rebalancing, tiered storage to S3, and an embedded Raft metadata quorum
 (Apache Ratis) instead of ZooKeeper. It also has two things Kafka doesn't ship: broker-side
 Avro schema enforcement and GDPR crypto-shredding of tagged fields. Every performance number
@@ -18,6 +19,7 @@ flowchart LR
         N[Netty event loops] --> E[Per-connection<br/>serializing executor<br/>+ backpressure]
         E --> Q[Quotas] --> S[Schema validation<br/>+ PII encryption] --> I[Idempotence]
         I --> PT[Partition<br/>segments + dense index<br/>group-commit fsync]
+        PT <-->|REPLICA_FETCH| R[Followers on other brokers<br/>ISR · high watermark · leader epochs]
         PT -->|sealed segments, Zstd| T[(S3 / SeaweedFS)]
         E --> G[Group coordinator<br/>+ __consumer_offsets]
         E --> M[Raft metadata member<br/>Apache Ratis]
@@ -28,8 +30,10 @@ flowchart LR
 ```
 
 Each broker embeds a member of the metadata quorum, and the Raft leader acts as the controller.
-Metadata (brokers, topics, partition leadership, schemas, erasures) is a replicated state
-machine; the data path never touches consensus.
+Metadata (brokers, topics, partition leadership and ISR, schemas, wrapped data keys, erasures) is
+a replicated state machine. Partition data replicates separately, Kafka-style: followers pull
+from the leader, and the data path never touches consensus. See
+[`docs/replication.md`](docs/replication.md).
 
 ## Quick start
 
@@ -71,6 +75,27 @@ connections into the broker's full produce path. Full matrix and caveats are in
 
 The fsync numbers are true-to-disk: on macOS, Java's `force()` takes as long as
 `F_FULLFSYNC` (3.6 ms on this machine), not plain `fsync` (0.03 ms).
+
+### Cost of replication (3 brokers)
+
+Three broker JVMs on one machine (loopback), one partition, 1 KB records, one producer
+connection with 5 requests in flight. Produced by
+[`scripts/bench-replication.sh`](scripts/bench-replication.sh); raw data in
+[`docs/bench/replication.csv`](docs/bench/replication.csv).
+
+| Configuration | Max throughput | p50 / p99 at 5,000 records/s |
+|---|---|---|
+| RF=1, `acks=1` | 40.2K rec/s | 0.08 / 0.89 ms |
+| RF=3, `acks=1` | 16.6K rec/s | 0.10 / 1.11 ms |
+| RF=3, `acks=all` | 5.7K rec/s | 0.38 / 2.39 ms |
+
+- With RF=3, followers keep up (the ISR never shrank during the run), and the three JVMs share
+  the laptop's 8 cores while the leader also serves replica fetches.
+- `acks=all` on one connection is bounded by one replication round trip per request, because the
+  broker processes a connection's requests in order. Kafka does the same (its network layer
+  mutes a connection until the response is sent) and gets throughput from batching many records
+  into each request, which StormLog's client doesn't do yet.
+- Below saturation, an `acks=all` write is on all three replicas with p99 ≈ 2.4 ms.
 
 ### Against Apache Kafka 4.3.1
 
@@ -152,7 +177,6 @@ replication in this comparison.
 
 | Non-goal | Why | Consequence |
 |---|---|---|
-| Replication | Doing it correctly (ISR, high watermark, leader epochs, truncation) is its own project; the original fire-and-forget version silently diverged and was removed | A dead broker's partitions are **offline** until it returns; the controller never elects a replica without the data |
 | Distributed rate limiting | Quotas are per broker and per client ID; a cluster-wide budget needs coordination on the hot path | A client spread over N brokers gets up to N × its quota |
 | Tiered storage for compacted topics | Compaction rewrites history that's already in S3 | Compacted topics stay local (Kafka has the same limit) |
 | TLS, authentication, ACLs | Out of scope for a storage/coordination project | Run only on a trusted network |
@@ -162,8 +186,10 @@ replication in this comparison.
 ## Known limitations
 
 - **Group lag is partial.** A group's coordinator reports lag only for partitions it hosts.
-- **No coordinator failover.** If a group's coordinator broker is down, that group can't commit or rebalance until it returns.
-- **Combined-mode controller.** Every broker runs a quorum member, so losing the controller also loses the partitions it leads (see [failure modes](docs/failure-modes.md#correlated-failure-the-controller-also-leads-partitions)); production would use dedicated controller nodes.
+- **No preferred-leader rebalancing.** After a failover, leadership stays where it moved, so it can concentrate on fewer brokers.
+- **One replica fetch per partition** rather than one batched fetch per broker pair (Kafka's design); fine at demo scale, wasteful with thousands of partitions.
+- **Idempotent producer state isn't replicated** (the log format carries no producer IDs): after a failover the producer re-initializes, and an in-flight retry may be duplicated.
+- **Combined-mode controller.** Every broker runs a quorum member, so losing the controller also loses its partition leaderships for one election plus the session timeout (see [failure modes](docs/failure-modes.md#correlated-failure-the-controller-also-leads-partitions)); production would use dedicated controller nodes.
 
 ## Bugs found and fixed along the way
 
@@ -184,6 +210,8 @@ Each was found by measuring or by a test written to break the feature, and each 
 | Legacy fetch numbered records sequentially | Consumers mis-positioned after compaction |
 | Shutdown of the last quorum member retried forever | Broker shutdown hung for minutes |
 | Erasure missed by a broker catching up from a Raft snapshot; raw entity IDs in the Raft log | A "forgotten" person's data still readable; their identifier persisted forever |
+| ISR "caught up" compared against the leader's *current* log end | Healthy followers evicted from the ISR under steady writes, leaving no failover candidate |
+| Wrapped data keys were per broker | After a failover the new leader could not decrypt PII it held |
 | Restart races: heartbeats started after the registration had been applied, registration gave up after one timeout, watch callbacks blocked metadata notifications | A restarted broker could be fenced again, or stay unregistered or with a stale view of the cluster forever |
 | An IDE compiling into `target/` emitted class files for code that didn't compile | Maven reported success on broken code (hence `-Dbuild.dir`) |
 
@@ -191,6 +219,7 @@ Each was found by measuring or by a test written to break the feature, and each 
 
 | Document | Contents |
 |---|---|
+| [`docs/replication.md`](docs/replication.md) | Replication design: ISR, high watermark, leader-epoch truncation, what replicates |
 | [`docs/durability.md`](docs/durability.md) | Durability tiers, what each number means, macOS vs Linux `fsync` |
 | [`docs/failure-modes.md`](docs/failure-modes.md) | Failure matrix for every subsystem, including correlated controller failure |
 | [`docs/decisions.md`](docs/decisions.md) | 22 architecture decisions with alternatives and trade-offs |

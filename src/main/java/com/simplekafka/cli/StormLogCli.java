@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <pre>
  * java -cp stormlog.jar com.simplekafka.cli.StormLogCli --bootstrap HOST:PORT COMMAND ...
  *   describe
- *   create-topic TOPIC PARTITIONS
+ *   create-topic TOPIC PARTITIONS [REPLICATION_FACTOR]
  *   produce TOPIC PARTITION MESSAGE
  *   produce-batch TOPIC COUNT              round-robin across partitions
  *   consume TOPIC PARTITION [FROM_OFFSET]  print what's there and exit
@@ -40,8 +40,9 @@ public class StormLogCli {
             switch (command) {
                 case "describe" -> describe(client);
                 case "create-topic" -> {
-                    client.createTopic(args[3], Integer.parseInt(args[4]), (short) 1);
-                    System.out.println("Created " + args[3] + " with " + args[4] + " partitions");
+                    short rf = args.length > 5 ? Short.parseShort(args[5]) : 1;
+                    client.createTopic(args[3], Integer.parseInt(args[4]), rf);
+                    System.out.println("Created " + args[3] + " with " + args[4] + " partitions, replication factor " + rf);
                     describe(client);
                 }
                 case "produce" -> {
@@ -140,7 +141,8 @@ public class StormLogCli {
             StringBuilder line = new StringBuilder("  " + t.getKey() + ":");
             for (SimpleKafkaClient.PartitionLayout p : t.getValue()) {
                 line.append(" p").append(p.partition()).append("->")
-                        .append(p.leader() < 0 ? "OFFLINE" : "broker" + p.leader());
+                        .append(p.leader() < 0 ? "OFFLINE" : "broker" + p.leader())
+                        .append(p.replicas().size() > 1 ? " (replicas " + p.replicas() + ")" : "");
             }
             System.out.println(line);
         }

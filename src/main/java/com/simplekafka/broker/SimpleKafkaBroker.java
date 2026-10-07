@@ -150,7 +150,7 @@ public class SimpleKafkaBroker {
         replicaManager = new ReplicaManager(this);
         replicaManager.onBecomeLeader(tp -> {
             if (tp.topic().equals(ConsumerOffsetStore.TOPIC)) {
-                offsetStore.invalidate(tp.partition()); // rebuild from the replicated log we now lead
+                offsetStore.reload(tp.partition()); // rebuild from the replicated log we now lead
             }
         });
         zkClient.onPartitionStateChange(() -> controllerEvents.execute(this::reloadAllTopics));
@@ -845,7 +845,7 @@ public class SimpleKafkaBroker {
             }
             Partition p = hostedPartition(c.topic(), c.partition());
             if (p != null) {
-                long end = p.getNextOffset();
+                long end = p.getHighWatermark(); // what consumers can actually read
                 rows.add(new AdminHttpServer.PartitionLag(c.group(), c.topic(), c.partition(), c.offset(), end,
                         Math.max(0, end - c.offset())));
             }

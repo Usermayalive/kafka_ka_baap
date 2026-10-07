@@ -49,7 +49,7 @@ Durability semantics are in [durability.md](durability.md); erasure semantics ar
 | S3 unavailable during upload | Upload future fails | Segment stays local (nothing is deleted before upload) | Retried on next broker start | `TieredStorageTest.testSealedSegmentNotUploadedBeforeCrash…` |
 | S3 unavailable during a cold read | Download fails | That fetch fails; hot (local) data unaffected | Client retries | Untested |
 | Crash between upload and manifest write | Segment uploaded but not in `.remote_segments` | Re-uploaded on restart (idempotent overwrite) | — | Follows from startup re-upload |
-| Coordinator broker down | `FIND_COORDINATOR` → `COORDINATOR_NOT_AVAILABLE` | Groups mapped to its `__consumer_offsets` partition can't commit or rebalance; consumption of already-assigned partitions continues | Broker returns (no replication to fail over to) | Untested |
+| Coordinator broker down | `FIND_COORDINATOR` → new leader of the offsets partition | Groups mapped to it rejoin (membership is soft state); committed offsets survive | New coordinator rebuilds offsets from the replicated `__consumer_offsets` | `ReplicationTest.testCommittedOffsetsSurviveCoordinatorCrash` |
 | Consumer crashes (no leave) | Session timeout (heartbeats stop) | Its partitions are unassigned until the timeout, then reassigned | Automatic | `GroupConsumerTest.testCrashedMember…` |
 | Consumer restarts quickly (static member) | Same instance ID within the timeout | No rebalance; same assignment | — | `testStaticMemberRestart…` |
 | Rebalance | Generation bump | Only moved partitions pause; the old owner commits before releasing | Cooperative handoff | `testThirdMemberTriggersStickyCooperativeRebalance` |
@@ -71,7 +71,12 @@ Durability semantics are in [durability.md](durability.md); erasure semantics ar
 | New node joins | Starts as a non-voting learner | None until promoted | Promotion once caught up | `testLearnerCatchesUp…` |
 | Promotion to an even voter count | Guard in `promote` | Refused (`409` via admin) | Promote two at once | `testLearnerCatchesUpAndEvenQuorumPromotionIsRefused` |
 | Last quorum member shuts down | Unregister can't commit | — | Bounded 2 s wait (it used to hang for minutes) | `ClusterTest` teardown |
-| Partition leader dies (no replication) | Controller after session timeout | **Partition offline** until its broker returns; producers get `LEADER_NOT_AVAILABLE` | Same broker returns with its data | `ClusterTest` |
+| Partition leader dies, RF ≥ 2 | Controller after session timeout | Brief unavailability; then a live **in-sync** follower leads with every committed record | Automatic failover (leader epoch +1, dead broker leaves the ISR) | `ReplicationTest.testReplicasConverge…` |
+| Partition leader dies, RF = 1 (or no live ISR member) | Controller after session timeout | **Partition offline** until an in-sync replica returns; no unclean election | The broker returns with its data | `ClusterTest` |
+| Ex-leader returns with unreplicated records | Leader-epoch comparison on its first fetch | Its divergent tail would conflict with the new leader's records | Truncates to where its epoch ended on the new leader, then catches up and rejoins the ISR | `testRestartedLeaderTruncatesDivergentTailAndRejoins` |
+| Follower falls behind (slow disk, GC, partition) | Not caught up for 10 s | Leaves the ISR; `acks=all` stops waiting for it | Rejoins on reaching the high watermark | `testMinInsyncReplicas…` |
+| ISR smaller than `min.insync.replicas` | Produce path | `acks=all` rejected with `NOT_ENOUGH_REPLICAS` (`acks=1` still accepted) | Followers rejoin | `testMinInsyncReplicas…` |
+| Records written but not yet on every in-sync replica | High watermark | Invisible to consumers until committed; never served if later truncated | — | `testConsumersOnlySeeCommittedRecords` |
 
 ### Correlated failure: the controller also leads partitions
 
@@ -84,14 +89,14 @@ fail at once:
    can't start until the new controller is elected, so detection takes the election plus the 3 s
    session timeout: **~2.8 s measured** in `ClusterTest` before the dead broker's partitions are
    marked offline.
-2. **Its partitions.** With no replication they stay offline until the broker returns.
+2. **Its partitions.** With RF ≥ 2 they fail over to in-sync followers once the new controller
+   acts; with RF = 1 they stay offline until the broker returns.
 
 **Mitigation (production):** run dedicated controller nodes, i.e. quorum members that host no
 partitions (KRaft's `process.roles=controller`). A broker failure is then never a controller
 failure, and a controller failure never takes data offline. StormLog's `MetadataQuorum` already
 runs independently of the data path, so the change is to start it without a Netty server or
-partitions. It isn't packaged as a mode. Separately, replication (a non-goal here) is what turns
-"partition offline until the broker returns" into a sub-second leader failover.
+partitions. It isn't packaged as a mode.
 
 ## Phase 6: Schemas and GDPR
 

@@ -18,10 +18,12 @@ can stay wherever it is, because nobody can read it any more.
    `enc:v1:<generation>:base64(iv ‖ ciphertext ‖ tag)`, and the additional authenticated data is
    `entityId/field/generation`, so ciphertext can't be moved to another field, entity or key
    generation. Only ciphertext reaches the log, tiered storage and backups.
-3. **Keys.** One random 256-bit DEK per entity and *key generation*, created on first use and
-   stored *wrapped* by a `MasterKeyProvider` in a RocksDB store on each broker
-   (`<data>/__dek_store`). Keys are named `<sha256(entityId)>-g<generation>`, so the raw entity
-   ID never appears in the key store or KMS. The wrapped DEK is written with sync.
+3. **Keys.** One random 256-bit DEK per entity and *key generation*, created on first use,
+   wrapped by a `MasterKeyProvider`, and stored **in the Raft metadata** (`CREATE_DEK`, first
+   proposal wins), so every replica of a partition, and any future leader, decrypts with the same
+   key. Keys are named `<sha256(entityId)>-g<generation>`, so the raw entity ID never appears in
+   the metadata, the key store or KMS. All brokers must share the master key provider. Standalone
+   brokers (no quorum) keep wrapped keys in a local RocksDB store instead.
 4. **Fetch.** The leader decrypts PII fields before returning records, so consumers see
    plaintext and need no key access.
 5. **Erasure.** The broker receiving `FORGET_ENTITY` hashes the entity ID and replicates only
@@ -62,7 +64,7 @@ counts a hierarchical scheme (e.g. per-tenant keys) is the realistic compromise.
 | Stolen disk, backup, or S3 bucket of log segments | ✅ | Segments contain only PII ciphertext; keys aren't in segments. |
 | Read access to segments **and** the DEK store, but not the master key | ✅ | DEKs are stored wrapped. |
 | Erasure request, then a stale backup of segments is restored | ✅ | The DEK is gone, so restored ciphertext is unreadable. |
-| Erasure request, then a stale backup of the DEK store **plus** the env master key | ❌ (Env) / ✅ (KMS) | The env provider can't revoke old wrapped copies; KMS key deletion can. |
+| Erasure request, then a stale copy of the wrapped key (an old metadata snapshot, Raft log segment not yet purged, or backup) **plus** the env master key | ❌ (Env) / ✅ (KMS) | Erasure removes the wrapped key from the live image and future snapshots, but can't revoke copies already made; KMS key deletion can. |
 | A malicious or compromised broker process | ❌ | The broker holds unwrapped DEKs in memory (LRU cache) and decrypts on fetch. Encryption at rest is not end-to-end encryption. |
 | A consumer that already read plaintext before erasure | ❌ | Shredding can't recall copies made downstream; that's the consumer's own erasure obligation. |
 | Non-PII fields, keys, topic names, offsets | ❌ | Only tagged fields are encrypted. Putting personal data in untagged fields or in the entity ID itself defeats the scheme; the entity ID should be an opaque surrogate key. |

@@ -8,7 +8,16 @@ records, all connections producing to a single partition, measured end-to-end th
 broker by `BrokerBenchmark` (Netty → per-connection executor → quotas → idempotence →
 `Partition`). Each configuration runs 1 s warmup + 3 s measurement.
 
-## The three tiers
+## Replication (orthogonal to the tiers below)
+
+With replication factor ≥ 2, `acks=all` (the client default) acknowledges a write only once
+every in-sync replica has it, so an acknowledged write survives the loss of the leader's
+machine, including its page cache, as long as one in-sync replica survives. That is Kafka's
+durability model: page-cache writes on several machines rather than fsync on one.
+`min.insync.replicas` sets how many copies an `acks=all` write needs. See
+[replication.md](replication.md).
+
+## The three tiers (per replica)
 
 ### 1. Page cache — `OS_PAGE_CACHE` (default)
 
@@ -19,10 +28,10 @@ No `fsync`.
 |---|---|
 | Broker process crash (`kill -9`, OOM, JVM crash) | OS crash, kernel panic, power loss: the unflushed tail |
 
-This is Apache Kafka's default (`log.flush.interval.messages` is effectively infinite). Kafka
-gets durability from replication across machines rather than from fsync; StormLog does not
-replicate (see README, non-goals), so in this mode an OS crash on the single broker that owns
-a partition can lose recently acknowledged writes.
+This is Apache Kafka's default (`log.flush.interval.messages` is effectively infinite). Like
+Kafka, StormLog gets durability across OS crashes from replication: with RF ≥ 2 and `acks=all`,
+an OS crash on one machine loses nothing acknowledged. With RF = 1, an OS crash on the broker
+that owns a partition can lose recently acknowledged writes.
 
 **Recovery:** on startup, `Partition` drops index entries whose record is not fully in the
 log and truncates log bytes that have no index entry (`truncateTornTail`). Readers never see

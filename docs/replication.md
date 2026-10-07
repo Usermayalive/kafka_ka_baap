@@ -72,6 +72,13 @@ original approach) can lose committed records or leave two replicas with differe
 the same offset. `ReplicationTest.testRestartedLeaderTruncatesDivergentTailAndRejoins` creates
 exactly that situation and checks the replicas end byte-identical.
 
+## Cost
+
+On three broker JVMs on one laptop (1 KB records, one connection, 5 in flight): RF=1 40K
+records/s; RF=3 with `acks=1` 16.6K/s; RF=3 with `acks=all` 5.7K/s, bounded by one replication
+round trip per request on a connection. Below saturation, `acks=all` p99 is about 2.4 ms. Details
+in the README.
+
 ## What else replicates
 
 | State | How | After failover |

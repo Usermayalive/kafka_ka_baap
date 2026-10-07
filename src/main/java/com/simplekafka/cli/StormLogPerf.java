@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * per request (StormLog's client does not batch).
  *
  * <pre>
- * StormLogPerf HOST:PORT TOPIC NUM_RECORDS RECORD_SIZE IN_FLIGHT [idempotent|plain] [RECORDS_PER_SEC]
+ * StormLogPerf HOST:PORT TOPIC NUM_RECORDS RECORD_SIZE IN_FLIGHT [idempotent|plain] [RECORDS_PER_SEC] [all|1]
  * </pre>
  * With RECORDS_PER_SEC, sends are paced on a fixed schedule (like kafka-producer-perf-test
  * --throughput), so latency is measured below saturation instead of including queueing.
@@ -35,6 +35,7 @@ public class StormLogPerf {
         boolean idempotent = args.length > 5 && args[5].equals("idempotent");
         long ratePerSec = args.length > 6 ? Long.parseLong(args[6]) : 0;
         long intervalNanos = ratePerSec > 0 ? 1_000_000_000L / ratePerSec : 0;
+        byte acks = args.length > 7 && args[7].equals("all") ? KafkaFrame.ACKS_ALL : KafkaFrame.ACKS_LEADER;
 
         try (BrokerConnection conn = BrokerConnection.connect(hostPort[0], Integer.parseInt(hostPort[1]))) {
             long producerId = KafkaFrame.NO_PRODUCER_ID;
@@ -60,7 +61,7 @@ public class StormLogPerf {
                 window.acquire();
                 final int index = i;
                 final long sentAt = System.nanoTime();
-                conn.sendAsync(KafkaFrame.API_KEY_PRODUCE, request(topic, producerId, i, payload)).whenComplete((resp, err) -> {
+                conn.sendAsync(KafkaFrame.API_KEY_PRODUCE, request(topic, producerId, i, payload, acks)).whenComplete((resp, err) -> {
                     if (err != null || ByteBuffer.wrap(resp.getPayload()).getShort() != KafkaFrame.ERROR_NONE) {
                         errors.incrementAndGet();
                     }
@@ -80,7 +81,7 @@ public class StormLogPerf {
         System.exit(0);
     }
 
-    private static byte[] request(String topic, long producerId, int sequence, byte[] payload) throws IOException {
+    private static byte[] request(String topic, long producerId, int sequence, byte[] payload, byte acks) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(payload.length + 64);
         DataOutputStream out = new DataOutputStream(bytes);
         out.writeUTF("perf");
@@ -91,6 +92,7 @@ public class StormLogPerf {
         out.writeInt(sequence);
         out.writeInt(payload.length);
         out.write(payload);
+        out.writeByte(acks);
         return bytes.toByteArray();
     }
 }

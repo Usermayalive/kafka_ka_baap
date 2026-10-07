@@ -21,9 +21,10 @@ since, *outside* the partition lock. Throughput then scales with concurrent conn
 connections: ~1,350 op/s) while each acknowledged write is still on stable storage.
 
 ### 3. Page cache as the default durability
-Kafka's default is no fsync, relying on replication for durability. StormLog has no replication
-(decision 11), so the honest framing is: the default survives process crashes and loses the
-unflushed tail on OS crash or power loss; fsync mode is available per broker. Torn tails are
+Kafka's default is no fsync, relying on replication for durability, and StormLog follows it
+(decision 11): with RF ≥ 2 and `acks=all` an acknowledged write survives one machine's OS crash.
+With RF = 1 the default survives process crashes and loses the unflushed tail on OS crash or
+power loss; fsync mode is available per broker. Torn tails are
 truncated to a clean record boundary on startup, so a crash never yields a corrupt read.
 
 ### 4. A compaction commit point (atomic directory rename)
@@ -73,12 +74,14 @@ target and grants a partition only after its previous owner reports releasing it
 untouched partitions through a rebalance, and the assignment logic lives in one place. Static
 membership is the client default, so rolling restarts don't trigger rebalances.
 
-### 11. No replication (explicit non-goal)
-Replication done properly involves ISR tracking, high watermarks, leader epochs, truncation on
-failover, and acks semantics. The existing fire-and-forget replication appended to followers
-without offsets and was worse than none: followers silently diverged. It was removed. The cost is
-explicit: a dead broker's partitions are offline until it returns, and the controller never
-elects an out-of-sync replica (which would silently lose data).
+### 11. Pull replication with ISR and leader epochs (not chain replication)
+The original fire-and-forget replication appended to followers without offsets and silently
+diverged, so it was removed and later rebuilt properly. Followers pull from the leader (Kafka's
+model); the leader's high watermark is the minimum log end across the in-sync replicas, and only
+in-sync replicas are eligible for election. Chain replication (leader → F1 → F2) was considered:
+it halves leader egress at RF=3, but every write pays every hop's latency and a mid-chain failure
+needs chain repair. Divergence after failover is resolved with leader-epoch history (KIP-101/279);
+truncating to the high watermark, Kafka's original design, can lose committed data.
 
 ### 12. Embedded Raft (Apache Ratis) instead of ZooKeeper or a hand-written Raft
 ZooKeeper is an external dependency with its own operational surface, and Kafka removed it for
@@ -133,6 +136,13 @@ un-compacted RocksDB files). Per-entity KMS keys make erasure irrevocable, at ab
 month. Entities are referenced only by SHA-256 so erasure doesn't persist the identifier in the
 Raft log, KMS, or the audit trail. Keys are versioned by erasure count, so data produced after an
 erasure is readable while older data stays erased.
+
+### 21a. Replicated data keys
+Per-broker data keys broke under replication: a follower holds the leader's ciphertext, so after
+failover it couldn't decrypt. Wrapped DEKs moved into the Raft metadata (first proposal wins), so
+every replica uses the same key and erasure removes it cluster-wide. Cost: wrapped keys (about
+60 bytes per entity and generation) live in every node's metadata snapshot, and stale Raft log
+segments hold them until purged; per-entity KMS keys keep erasure irrevocable regardless.
 
 ### 21. Bounded metric cardinality
 Topic and group names are chosen by clients, so per-label series are unbounded input to the

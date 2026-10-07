@@ -86,6 +86,7 @@ public class Partition {
     private long lastHwCheckpointNanos;
     private final LeaderEpochCache leaderEpochs;
     private volatile boolean tieringEnabled = true;
+    private volatile Runnable appendListener;
 
     private final Object flushMonitor = new Object();
     private long durableUpToOffset = -1;
@@ -352,6 +353,10 @@ public class Partition {
         }
         synchronized (replicationSignal) {
             replicationSignal.notifyAll(); // wake replica fetches long-polling for new data
+        }
+        Runnable listener = appendListener;
+        if (listener != null) {
+            listener.run(); // leader: an ISR of one commits on append, without waiting for a fetch
         }
         return currentOffset;
     }
@@ -655,6 +660,11 @@ public class Partition {
         } catch (IOException | NumberFormatException e) {
             return -1;
         }
+    }
+
+    /** Called after every append; the replica manager sets it while this broker leads the partition. */
+    public void setAppendListener(Runnable appendListener) {
+        this.appendListener = appendListener;
     }
 
     /** Only a partition's leader tiers its segments (replicas would upload the same objects). */

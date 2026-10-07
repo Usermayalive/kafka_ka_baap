@@ -101,7 +101,6 @@ public class ReplicaManager implements AutoCloseable {
     private final SimpleKafkaBroker broker;
     private final Map<TopicPartition, LeaderState> leaders = new ConcurrentHashMap<>();
     private final Map<TopicPartition, Fetcher> fetchers = new ConcurrentHashMap<>();
-    private final Map<Integer, BrokerConnection> connections = new ConcurrentHashMap<>();
     private final ExecutorService isrProposals = Executors.newSingleThreadExecutor(daemon("isr-proposals"));
     private final ScheduledExecutorService isrShrinker = Executors.newSingleThreadScheduledExecutor(daemon("isr-shrinker"));
     private volatile Consumer<TopicPartition> onBecomeLeader = tp -> {};
@@ -148,6 +147,7 @@ public class ReplicaManager implements AutoCloseable {
                 } else {
                     stopFetcher(tp);
                     leaders.remove(tp);
+                    partition.setAppendListener(null);
                 }
             }
         }
@@ -177,6 +177,7 @@ public class ReplicaManager implements AutoCloseable {
         partition.setTieringEnabled(true);
         LeaderState leader = new LeaderState(tp, partition, state.leaderEpoch(), state.replicas(), state.isr());
         leaders.put(tp, leader);
+        partition.setAppendListener(leader::advanceHighWatermark);
         leader.advanceHighWatermark();
         LOGGER.info("Broker " + brokerId + " is leader of " + tp.topic() + "-" + tp.partition()
                 + " at epoch " + state.leaderEpoch() + " (ISR " + state.isr() + ", log end " + partition.getNextOffset() + ")");
@@ -185,6 +186,7 @@ public class ReplicaManager implements AutoCloseable {
 
     private void becomeFollower(TopicPartition tp, Partition partition, MetadataImage.PartitionState state) {
         leaders.remove(tp);
+        partition.setAppendListener(null);
         partition.setTieringEnabled(false);
         Fetcher existing = fetchers.get(tp);
         if (existing != null && existing.leaderId == state.leader() && existing.leaderEpoch == state.leaderEpoch()) {
@@ -205,6 +207,7 @@ public class ReplicaManager implements AutoCloseable {
             if (f.thread != null) {
                 f.thread.interrupt();
             }
+            f.closeConnection();
         }
     }
 
@@ -331,6 +334,20 @@ public class ReplicaManager implements AutoCloseable {
         final int leaderEpoch;
         volatile boolean running = true;
         volatile Thread thread;
+        /**
+         * Each fetcher has its own connection. The leader handles a connection's requests in order,
+         * so on a shared connection a fetch for a busy partition would wait behind 500 ms
+         * long-polls for idle ones. (Kafka instead batches all partitions into one fetch.)
+         */
+        private BrokerConnection connection;
+
+        void closeConnection() {
+            BrokerConnection c = connection;
+            connection = null;
+            if (c != null) {
+                c.close();
+            }
+        }
 
         Fetcher(TopicPartition tp, Partition partition, int leaderId, int leaderEpoch) {
             this.tp = tp;
@@ -351,10 +368,7 @@ public class ReplicaManager implements AutoCloseable {
                         return;
                     }
                     if (!(e instanceof BrokerErrorException)) {
-                        BrokerConnection stale = connections.remove(leaderId);
-                        if (stale != null) {
-                            stale.close();
-                        }
+                        closeConnection();
                     }
                     LOGGER.log(Level.FINE, "Replica fetch of " + tp + " from broker " + leaderId + " failed", e);
                     try {
@@ -370,7 +384,10 @@ public class ReplicaManager implements AutoCloseable {
             while (fetchingPausedForTest) {
                 Thread.sleep(50);
             }
-            BrokerConnection conn = connectionTo(leaderId);
+            if (connection == null || !connection.isActive()) {
+                connection = connectTo(leaderId);
+            }
+            BrokerConnection conn = connection;
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(bytes);
             out.writeInt(brokerId);
@@ -413,18 +430,12 @@ public class ReplicaManager implements AutoCloseable {
         }
     }
 
-    private BrokerConnection connectionTo(int targetBrokerId) throws IOException {
-        BrokerConnection existing = connections.get(targetBrokerId);
-        if (existing != null && existing.isActive()) {
-            return existing;
-        }
+    private BrokerConnection connectTo(int targetBrokerId) throws IOException {
         MetadataImage.BrokerRegistration target = broker.getMetadataLog().image().brokers().get(targetBrokerId);
         if (target == null) {
             throw new IOException("Leader broker " + targetBrokerId + " is not registered");
         }
-        BrokerConnection fresh = BrokerConnection.connect(target.host(), target.port());
-        connections.put(targetBrokerId, fresh);
-        return fresh;
+        return BrokerConnection.connect(target.host(), target.port());
     }
 
     /** Test hook: stop pulling from leaders (simulates a slow or partitioned follower). */
@@ -437,6 +448,5 @@ public class ReplicaManager implements AutoCloseable {
         new ArrayList<>(fetchers.keySet()).forEach(this::stopFetcher);
         isrShrinker.shutdownNow();
         isrProposals.shutdownNow();
-        connections.values().forEach(BrokerConnection::close);
     }
 }

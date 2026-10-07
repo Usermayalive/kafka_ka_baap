@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end demo: a 3-broker StormLog cluster with an embedded Raft metadata quorum.
-# Creates a topic, produces and consumes, kill -9's the controller, shows failover and the
-# offline partition, restarts the broker and shows its data back online. No Docker needed.
+# Creates a replicated topic (RF=3), produces and consumes, dead-letters a poison pill, kill -9's
+# the controller (which also leads a partition), shows leadership failing over to in-sync
+# followers with no write lost, restarts the broker and shows it rejoining. No Docker needed.
 #
 #   ./scripts/demo-cluster.sh            (builds the jar if missing)
 set -euo pipefail
@@ -54,8 +55,8 @@ wait_for "metadata leader" 60 quorum_has_leader "${BROKER_PORTS[0]}"
 wait_for "all 3 brokers registered" 60 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:${BROKER_PORTS[0]} describe 2>/dev/null | grep -o 'id=[123],' | sort -u | wc -l | grep -q 3"
 admin "${BROKER_PORTS[0]}" /admin/quorum; echo
 
-step "Creating topic 'orders' with 3 partitions (one per broker)"
-cli "${BROKER_PORTS[0]}" create-topic orders 3
+step "Creating topic 'orders': 3 partitions, replication factor 3 (each led by a different broker)"
+cli "${BROKER_PORTS[0]}" create-topic orders 3 3
 
 step "Producing 30 messages"
 cli "${BROKER_PORTS[0]}" produce-batch orders 30
@@ -73,20 +74,23 @@ cli "$P0_LEADER_PORT" consume-with-dlq orders 0 3
 CONTROLLER=$(controller_id "${BROKER_PORTS[0]}")
 SURVIVOR_PORT=${BROKER_PORTS[0]}; [ "$CONTROLLER" = "1" ] && SURVIVOR_PORT=${BROKER_PORTS[1]}
 step "kill -9 broker $CONTROLLER (the controller AND a partition leader)"
+BEFORE=$(for p in 0 1 2; do cli "$SURVIVOR_PORT" consume orders $p | wc -l; done | paste -sd+ - | bc)
 kill -9 "${PIDS[$(( CONTROLLER - 1 ))]}"
 PIDS[$(( CONTROLLER - 1 ))]=""
 wait_for "new controller" 30 bash -c "curl -s http://$HOST:$(( SURVIVOR_PORT + 1000 ))/admin/quorum | grep -q '\"leader\":[1-9]' && ! curl -s http://$HOST:$(( SURVIVOR_PORT + 1000 ))/admin/quorum | grep -q '\"leader\":$CONTROLLER,'"
 admin "$SURVIVOR_PORT" /admin/quorum; echo
-sleep 4 # session timeout (3s) -> the dead broker is unregistered and its partition marked offline
+# Session timeout (3s) -> the dead broker is unregistered; its partitions fail over to in-sync followers
+wait_for "failover to followers" 30 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep 'orders:' | grep -qv \"broker$CONTROLLER \" && ! java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep 'orders:' | grep -q OFFLINE"
 cli "$SURVIVOR_PORT" describe
+AFTER=$(for p in 0 1 2; do cli "$SURVIVOR_PORT" consume orders $p | wc -l; done | paste -sd+ - | bc)
+echo "  committed records before the crash: $BEFORE, readable after failover: $AFTER"
 
-step "Producing 9 more messages: the offline partition fails, the others keep working"
-cli "$SURVIVOR_PORT" produce-batch orders 9 || true
+step "Producing 9 more messages: every partition has a live leader, so all succeed"
+cli "$SURVIVOR_PORT" produce-batch orders 9
 
-step "Restarting broker $CONTROLLER: it re-registers and is re-elected leader of its partition"
+step "Restarting broker $CONTROLLER: it re-registers, truncates anything uncommitted, and catches up as a follower"
 start_broker "$CONTROLLER"
-# A restarted ex-leader may first have to catch up on a divergent log; wait for its partition
-wait_for "broker $CONTROLLER back online" 60 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep -q 'orders:.*' && ! java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep 'orders:' | grep -q OFFLINE"
+wait_for "broker $CONTROLLER registered" 60 bash -c "java -cp $JAR com.simplekafka.cli.StormLogCli --bootstrap $HOST:$SURVIVOR_PORT describe 2>/dev/null | grep -q 'id=$CONTROLLER,'"
 cli "$SURVIVOR_PORT" describe
 for p in 0 1 2; do
   echo "  orders-$p: $(cli "$SURVIVOR_PORT" consume orders $p | wc -l | tr -d ' ') messages"

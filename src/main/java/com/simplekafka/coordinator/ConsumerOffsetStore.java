@@ -114,11 +114,19 @@ public class ConsumerOffsetStore {
         }
     }
 
-    /** Forget the cached view of one offsets partition; rebuilt from its log on next use (new leader). */
-    public void invalidate(int offsetsPartition) {
+    /** Rebuild the cached view of one offsets partition from its replicated log (this broker now leads it). */
+    public void reload(int offsetsPartition) {
         synchronized (loaded) {
             loaded.remove(offsetsPartition);
             committed.keySet().removeIf(key -> partitionFor(key.substring(0, key.indexOf('\u0000'))) == offsetsPartition);
+            Partition log = localPartition.apply(offsetsPartition);
+            if (log != null) {
+                try {
+                    ensureLoaded(offsetsPartition, log);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to reload " + TOPIC + "-" + offsetsPartition + "; retried on first use", e);
+                }
+            }
         }
     }
 
