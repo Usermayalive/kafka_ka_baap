@@ -848,6 +848,12 @@ public class SimpleKafkaBroker {
             if (group != null && !group.equals(c.group())) {
                 continue;
             }
+            // Only the group's coordinator (leader of its offsets partition) reports its lag;
+            // a former coordinator's cache is stale
+            Partition offsetsLog = hostedPartition(ConsumerOffsetStore.TOPIC, ConsumerOffsetStore.partitionFor(c.group()));
+            if (offsetsLog == null || (offsetsLog.getLeader() > 0 && offsetsLog.getLeader() != brokerId)) {
+                continue;
+            }
             Partition p = hostedPartition(c.topic(), c.partition());
             if (p != null) {
                 long end = p.getHighWatermark(); // what consumers can actually read
